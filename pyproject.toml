@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-triposg"
 description = "TripoSG: High-Fidelity 3D Shape Synthesis using Large-Scale Rectified Flow Models"
-version = "0.1.1"
+version = "0.2.0"
 license = "LICENSE"
 dependencies = [
   "diffusers",

@@ -1,0 +1,401 @@
+{
+  "id": "60fc533c-cab0-4b1e-839b-b7783bd27ba5",
+  "revision": 0,
+  "last_node_id": 94,
+  "last_link_id": 186,
+  "nodes": [
+    {
+      "id": 83,
+      "type": "TripoSGModelLoader",
+      "pos": [
+        217.2832794189453,
+        314.48760986328125
+      ],
+      "size": [
+        240,
+        60
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "TRIPOSG",
+          "type": "TRIPOSG",
+          "links": [
+            181
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "TripoSGModelLoader",
+        "widget_ue_connectable": {}
+      },
+      "widgets_values": [
+        "VAST-AI/TripoSG"
+      ]
+    },
+    {
+      "id": 93,
+      "type": "TrimeshToMESH",
+      "pos": [
+        1009.8820190429688,
+        550.8804321289062
+      ],
+      "size": [
+        143.62850952148438,
+        26
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "trimesh",
+          "type": "TRIMESH",
+          "link": 183
+        }
+      ],
+      "outputs": [
+        {
+          "name": "MESH",
+          "type": "MESH",
+          "links": [
+            184
+          ]
+        }
+      ],
+      "properties": {
+        "widget_ue_connectable": {},
+        "Node name for S&R": "TrimeshToMESH"
+      }
+    },
+    {
+      "id": 92,
+      "type": "TripoSGInference",
+      "pos": [
+        880.0131225585938,
+        315.2850036621094
+      ],
+      "size": [
+        270,
+        170
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "TRIPOSG",
+          "link": 181
+        },
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 182
+        },
+        {
+          "name": "conditioning",
+          "shape": 7,
+          "type": "TRIPOSG_CONDITIONING",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "mesh",
+          "type": "TRIMESH",
+          "links": [
+            183
+          ]
+        },
+        {
+          "name": "parts",
+          "shape": 6,
+          "type": "TRIMESH",
+          "links": null
+        }
+      ],
+      "properties": {
+        "widget_ue_connectable": {},
+        "Node name for S&R": "TripoSGInference"
+      },
+      "widgets_values": [
+        0,
+        "fixed",
+        50,
+        7
+      ]
+    },
+    {
+      "id": 85,
+      "type": "LoadImage",
+      "pos": [
+        127.13652038574219,
+        547.0692749023438
+      ],
+      "size": [
+        317.4000244140625,
+        362
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "links": [
+            185
+          ]
+        },
+        {
+          "name": "masks",
+          "type": "MASK",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.3.43",
+        "Node name for S&R": "LoadImage",
+        "widget_ue_connectable": {}
+      },
+      "widgets_values": {
+        "image": "jkghed.png",
+        "keep_alpha_channel": false,
+        "upload": "image",
+        "$$canvas-image-preview": ""
+      }
+    },
+    {
+      "id": 94,
+      "type": "RMBG",
+      "pos": [
+        498.4338073730469,
+        599.6744995117188
+      ],
+      "size": [
+        340,
+        302
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 185
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            186
+          ]
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": null
+        },
+        {
+          "name": "MASK_IMAGE",
+          "type": "IMAGE",
+          "links": null
+        }
+      ],
+      "properties": {
+        "widget_ue_connectable": {},
+        "Node name for S&R": "RMBG"
+      },
+      "widgets_values": [
+        "RMBG-2.0",
+        1,
+        1024,
+        0,
+        0,
+        false,
+        false,
+        "Alpha",
+        "#222222"
+      ],
+      "color": "#222e40",
+      "bgcolor": "#364254"
+    },
+    {
+      "id": 86,
+      "type": "TripoSGPrepareImage",
+      "pos": [
+        595.8707885742188,
+        395.6946105957031
+      ],
+      "size": [
+        250,
+        50
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 186
+        },
+        {
+          "name": "mask",
+          "shape": 7,
+          "type": "MASK",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            182
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "TripoSGPrepareImage",
+        "widget_ue_connectable": {}
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 67,
+      "type": "SaveGLB",
+      "pos": [
+        1197.0206298828125,
+        314.0318908691406
+      ],
+      "size": [
+        620,
+        760
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "label": "mesh",
+          "name": "mesh",
+          "type": "MESH",
+          "link": 184
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.3.43",
+        "Node name for S&R": "SaveGLB",
+        "Camera Info": {
+          "position": {
+            "x": -9.544214447911918,
+            "y": 6.069013862817575,
+            "z": 12.345853985015003
+          },
+          "target": {
+            "x": 0,
+            "y": 2.5,
+            "z": 0
+          },
+          "zoom": 1,
+          "cameraType": "perspective"
+        },
+        "Background Color": "#525252",
+        "Show Grid": true,
+        "Material Mode": "normal",
+        "Camera Type": "perspective",
+        "FOV": 28,
+        "widget_ue_connectable": {}
+      },
+      "widgets_values": [
+        "mesh/ComfyUI",
+        "",
+        "",
+        "",
+        "",
+        ""
+      ]
+    }
+  ],
+  "links": [
+    [
+      181,
+      83,
+      0,
+      92,
+      0,
+      "TRIPOSG"
+    ],
+    [
+      182,
+      86,
+      0,
+      92,
+      1,
+      "IMAGE"
+    ],
+    [
+      183,
+      92,
+      0,
+      93,
+      0,
+      "TRIMESH"
+    ],
+    [
+      184,
+      93,
+      0,
+      67,
+      0,
+      "MESH"
+    ],
+    [
+      185,
+      85,
+      0,
+      94,
+      0,
+      "IMAGE"
+    ],
+    [
+      186,
+      94,
+      0,
+      86,
+      0,
+      "IMAGE"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.6053012502290658,
+      "offset": [
+        140.56174328555971,
+        13.186548511284347
+      ]
+    },
+    "frontendVersion": "1.23.4",
+    "ue_links": [],
+    "links_added_by_ue": [],
+    "VHS_latentpreview": false,
+    "VHS_latentpreviewrate": 0,
+    "VHS_MetadataImage": true,
+    "VHS_KeepIntermediate": true
+  },
+  "version": 0.4
+}

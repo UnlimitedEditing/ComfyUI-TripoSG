@@ -2,8 +2,11 @@ import os
 import cv2
 import numpy as np
 import torch
+import trimesh as Trimesh
+from pathlib import Path
 from huggingface_hub import snapshot_download
 from PIL import Image
+from typing import Dict, Any
 
 import folder_paths
 import comfy.utils
@@ -13,7 +16,8 @@ from comfy_extras.nodes_hunyuan3d import MESH
 # Import pipeline classes
 from .triposg.pipelines.pipeline_triposg import TripoSGPipeline
 from .triposg.pipelines.pipeline_triposg_scribble import TripoSGScribblePipeline
-
+from .partcrafter.pipelines.pipeline_partcrafter import PartCrafterPipeline
+from .partcrafter.utils.data_utils import get_colored_mesh_composition, scene_to_parts, load_surfaces
 
 gpu = mm.get_torch_device()
 cpu = torch.device("cpu")
@@ -63,7 +67,12 @@ class TripoSGModelLoader:
     @classmethod
     def INPUT_TYPES(s):
         return {
-            "required": {"model": (["VAST-AI/TripoSG", "VAST-AI/TripoSG-scribble"], {"default": "VAST-AI/TripoSG"})}
+            "required": {
+                "model": (
+                    ["VAST-AI/TripoSG", "VAST-AI/TripoSG-scribble", "wgsxm/PartCrafter"],
+                    {"default": "VAST-AI/TripoSG"},
+                )
+            }
         }
 
     RETURN_TYPES = ("TRIPOSG",)
@@ -82,6 +91,16 @@ class TripoSGModelLoader:
             pipe = TripoSGPipeline.from_pretrained(model_dir).to(gpu, torch.float16)
         elif model == "VAST-AI/TripoSG-scribble":
             pipe = TripoSGScribblePipeline.from_pretrained(model_dir).to(gpu, torch.float16)
+        elif model == "wgsxm/PartCrafter":
+            import shutil
+
+            custom_model_index_path = os.path.join(
+                os.path.dirname(__file__), "partcrafter", "models", "model_index.json"
+            )
+            target_model_index_path = os.path.join(model_dir, "model_index.json")
+            shutil.copy2(custom_model_index_path, target_model_index_path)
+
+            pipe = PartCrafterPipeline.from_pretrained(model_dir).to(gpu, torch.float16)
         else:
             raise ValueError(f"Unknown model: {model}")
 
@@ -134,7 +153,9 @@ class TripoSGInference:
             },
         }
 
-    RETURN_TYPES = ("MESH",)
+    RETURN_TYPES = ("TRIMESH", "TRIMESH")
+    RETURN_NAMES = ("trimesh", "parts")
+    OUTPUT_IS_LIST = (False, True)
     FUNCTION = "run_inference"
     CATEGORY = "TripoSG"
 
@@ -145,7 +166,7 @@ class TripoSGInference:
         seed,
         steps,
         cfg,
-        conditioning={},
+        conditioning=None,
     ):
         pil_image = tensor2pil(image)
 
@@ -164,10 +185,15 @@ class TripoSGInference:
                 num_inference_steps=steps,
                 guidance_scale=cfg,
                 callback_on_step_end=step_callback,
-            ).samples[0]
+            )
         elif pipe_class == "TripoSGScribblePipeline":
-            prompt = conditioning.get("prompt", "")
-            if not prompt:
+            if not conditioning:
+                raise ValueError("TripoSGScribbleConditioning must be provided")
+
+            if not isinstance(conditioning, TripoSGScribbleConditioning):
+                raise ValueError("Conditioning must be a TripoSGScribbleConditioning")
+
+            if not conditioning.prompt:
                 raise ValueError("Prompt is required for TripoSGScribblePipeline")
 
             outputs = model(
@@ -176,30 +202,36 @@ class TripoSGInference:
                 num_inference_steps=steps,
                 guidance_scale=0,  # CFG-distilled model
                 use_flash_decoder=False,
-                dense_octree_depth=8,
-                hierarchical_octree_depth=8,
                 callback_on_step_end=step_callback,
-                **conditioning,
-            ).samples[0]
+                **conditioning.to_dict(),
+            )
+        elif pipe_class == "PartCrafterPipeline":
+            if not conditioning:
+                raise ValueError("PartCrafterConditioning must be provided")
+
+            if not isinstance(conditioning, PartCrafterConditioning):
+                raise ValueError("Conditioning must be a PartCrafterConditioning")
+
+            outputs = model(
+                image=[pil_image] * conditioning.attention_kwargs["num_parts"],
+                generator=generator,
+                num_inference_steps=steps,
+                guidance_scale=cfg,
+                use_flash_decoder=False,
+                callback_on_step_end=step_callback,
+                **conditioning.to_dict(),
+            )
         else:
             raise ValueError(f"Unknown pipeline type: {pipe_class}")
 
-        # Convert outputs to torch tensors and add batch dimension
-        vertices = (
-            torch.from_numpy(outputs[0].astype(np.float32))
-            if not isinstance(outputs[0], torch.Tensor)
-            else outputs[0].float()
-        )
-        faces = (
-            torch.from_numpy(np.ascontiguousarray(outputs[1]))
-            if not isinstance(outputs[1], torch.Tensor)
-            else outputs[1]
-        )
-        vertices = vertices.unsqueeze(0)  # shape (1, N, 3)
-        faces = faces.unsqueeze(0)  # shape (1, M, 3)
-        mesh = MESH(vertices, faces)
+        parts = [m for m in outputs.meshes if m is not None]
 
-        return (mesh,)
+        if len(parts) == 1:
+            mesh = parts[0]
+        else:
+            mesh = get_colored_mesh_composition(parts)
+
+        return (mesh, parts)
 
 
 class SimplifyMesh:
@@ -273,8 +305,8 @@ class TripoSGPrepareImage:
         # Resize if too large
         H, W = rgb_image.shape[:2]
         max_side = max(H, W)
-        if max_side > 2048:
-            scale = 2048 / max_side
+        if max_side > 2000:
+            scale = 2000 / max_side
             new_H, new_W = int(H * scale), int(W * scale)
             rgb_image = cv2.resize(rgb_image, (new_W, new_H), interpolation=cv2.INTER_AREA)
             if alpha is not None:
@@ -316,15 +348,22 @@ class TripoSGPrepareImage:
         # Crop to bbox
         cropped = out_rgb[y : y + h, x : x + w, :]
 
-        # Pad to square with 10% padding
+        # Dynamic padding based on aspect ratio
         pad_ratio = 0.1
-        pad_h = int(max(h, w) * pad_ratio)
-        size = max(h, w) + 2 * pad_h
+        if w > h:
+            pad_h = int(w * pad_ratio)
+            pad_w = int(w * pad_ratio)
+            size = w + 2 * pad_w
+            y_off = int(pad_h + (w - h) / 2)
+            x_off = pad_w
+        else:
+            pad_h = int(h * pad_ratio)
+            pad_w = int(h * pad_ratio)
+            size = h + 2 * pad_h
+            y_off = pad_h
+            x_off = int(pad_w + (h - w) / 2)
+        
         padded = np.ones((size, size, 3), dtype=np.float32)
-
-        # Center crop
-        y_off = (size - h) // 2
-        x_off = (size - w) // 2
         padded[y_off : y_off + h, x_off : x_off + w, :] = cropped
 
         # To tensor [1, H, W, 3]
@@ -343,7 +382,28 @@ class TripoSGPrepareImage:
         return x, y, w, h
 
 
-class TripoSGConditioning:
+class BaseConditioning:
+    def get(self, key: str, default=None):
+        return getattr(self, key, default)
+
+    def __getitem__(self, key: str):
+        return getattr(self, key)
+
+    def __setitem__(self, key: str, value):
+        setattr(self, key, value)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert the conditioning object to a dictionary."""
+        return {key: value for key, value in self.__dict__.items()}
+
+
+class TripoSGScribbleConditioning(BaseConditioning):
+    def __init__(self, prompt: str, attention_kwargs: Dict[str, Any]):
+        self.prompt = prompt
+        self.attention_kwargs = attention_kwargs
+
+
+class TripoSGScribbleConditioningNode:
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -361,28 +421,149 @@ class TripoSGConditioning:
 
     def conditioning(self, prompt, prompt_confidence, scribble_confidence):
         return (
-            {
-                "prompt": prompt,
-                "attention_kwargs": {
+            TripoSGScribbleConditioning(
+                prompt=prompt,
+                attention_kwargs={
                     "cross_attention_scale": prompt_confidence,
                     "cross_attention_2_scale": scribble_confidence,
                 },
-            },
+            ),
         )
+
+
+class PartCrafterConditioning(BaseConditioning):
+    def __init__(self, num_tokens: int, max_num_expanded_coords: int, attention_kwargs: Dict[str, Any]):
+        self.num_tokens = num_tokens
+        self.max_num_expanded_coords = max_num_expanded_coords
+        self.attention_kwargs = attention_kwargs
+
+
+class PartCrafterConditioningNode:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "num_parts": ("INT", {"default": 1, "min": 1, "max": 100}),
+                "num_tokens": ("INT", {"default": 1024, "min": 1, "max": 4096}),
+                "max_num_expanded_coords": ("INT", {"default": 1e8, "min": 1, "max": 1e10}),
+            },
+        }
+
+    RETURN_TYPES = ("TRIPOSG_CONDITIONING",)
+    RETURN_NAMES = ("conditioning",)
+    FUNCTION = "conditioning"
+    CATEGORY = "TripoSG"
+
+    def conditioning(self, num_parts, num_tokens, max_num_expanded_coords):
+        return (
+            PartCrafterConditioning(
+                num_tokens=num_tokens,
+                max_num_expanded_coords=max_num_expanded_coords,
+                attention_kwargs={"num_parts": num_parts},
+            ),
+        )
+
+
+class TrimeshToMESH:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "trimesh": ("TRIMESH",),
+            }
+        }
+
+    RETURN_TYPES = ("MESH",)
+    OUTPUT_TOOLTIPS = ("MESH object containing vertices and faces as torch tensors.",)
+
+    FUNCTION = "load"
+    CATEGORY = "TripoSG"
+    DESCRIPTION = "Converts trimesh object to ComfyUI MESH object, which only includes mesh data"
+
+    def load(self, trimesh):
+        vertices = torch.tensor(trimesh.vertices, dtype=torch.float32)
+        faces = torch.tensor(trimesh.faces, dtype=torch.float32)
+        mesh = MESH(vertices.unsqueeze(0), faces.unsqueeze(0))
+
+        return (mesh,)
+
+
+class MESHToTrimesh:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "mesh": ("MESH",),
+            }
+        }
+
+    RETURN_TYPES = ("TRIMESH",)
+    OUTPUT_TOOLTIPS = ("TRIMESH object containing vertices and faces as torch tensors.",)
+
+    FUNCTION = "load"
+    CATEGORY = "TripoSG"
+    DESCRIPTION = "Converts trimesh object to ComfyUI MESH object, which only includes mesh data"
+
+    def load(self, mesh):
+        mesh_output = Trimesh.Trimesh(mesh.vertices[0], mesh.faces[0])
+        return (mesh_output,)
+
+
+class SaveTrimesh:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "trimesh": ("TRIMESH",),
+                "filename_prefix": ("STRING", {"default": "3D/TripoSG"}),
+                "file_format": (["glb", "obj", "ply", "stl", "3mf", "dae"],),
+            },
+            "optional": {
+                "save_file": ("BOOLEAN", {"default": True, "label_on": "output", "label_off": "temp"}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("glb_path",)
+    FUNCTION = "process"
+    CATEGORY = "TripoSG"
+    OUTPUT_NODE = True
+    DESCRIPTION = "Export trimesh object to model file"
+
+    def process(self, trimesh, filename_prefix, file_format, save_file=True):
+        save_dir = folder_paths.get_output_directory() if save_file else folder_paths.get_temp_directory()
+        full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(
+            filename_prefix, save_dir
+        )
+        output_glb_path = Path(full_output_folder, f"{filename}_{counter:05}_.{file_format}")
+        output_glb_path.parent.mkdir(exist_ok=True)
+
+        trimesh.export(output_glb_path, file_type=file_format)
+        relative_path = Path(subfolder) / f"{filename}_{counter:05}_.{file_format}"
+
+        return (str(relative_path),)
 
 
 # Node registration
 NODE_CLASS_MAPPINGS = {
     "TripoSGModelLoader": TripoSGModelLoader,
     "TripoSGInference": TripoSGInference,
-    "TripoSGConditioning": TripoSGConditioning,
-    "SimplifyMesh": SimplifyMesh,
     "TripoSGPrepareImage": TripoSGPrepareImage,
+    "TripoSGConditioning": TripoSGScribbleConditioningNode,
+    "PartCrafterConditioning": PartCrafterConditioningNode,
+    "SimplifyMesh": SimplifyMesh,
+    "MESHToTrimesh": MESHToTrimesh,
+    "TrimeshToMESH": TrimeshToMESH,
+    "SaveTrimesh": SaveTrimesh,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "TripoSGModelLoader": "TripoSG Model Loader",
     "TripoSGInference": "TripoSG Inference",
-    "TripoSGConditioning": "TripoSG Conditioning",
-    "SimplifyMesh": "Simplify Mesh",
+    "TripoSGConditioning": "TripoSG Scribble Conditioning",
+    "PartCrafterConditioning": "PartCrafter Conditioning",
     "TripoSGPrepareImage": "TripoSG Prepare Image",
+    "SimplifyMesh": "Simplify Mesh",
+    "MESHToTrimesh": "Mesh to Trimesh",
+    "TrimeshToMESH": "Trimesh to Mesh",
+    "SaveTrimesh": "Save Trimesh",
 }
