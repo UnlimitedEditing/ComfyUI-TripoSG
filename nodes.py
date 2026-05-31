@@ -323,7 +323,11 @@ class TripoSGPrepareImage:
             alpha = None
 
         if alpha is None and mask is None:
-            raise ValueError("Image has no valid alpha channel, please provide a mask.")
+            # Auto-remove white background for images without alpha
+            white_mask = np.all(image_np >= 250, axis=2)
+            alpha = np.where(white_mask, 0, 255).astype(np.uint8)
+            if not is_valid_alpha(alpha):
+                raise ValueError("Image has no valid alpha channel, please provide a mask.")
 
         if alpha is None:
             if mask.ndim == 3:
