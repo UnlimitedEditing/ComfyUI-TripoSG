@@ -4,7 +4,6 @@ import torch.nn as nn
 import scipy.ndimage
 from skimage import measure
 from einops import repeat
-from diso import DiffDMC
 import torch.nn.functional as F
 
 from triposg.utils.typing import *
@@ -463,12 +462,10 @@ def flash_extract_geometry(
     grid_logits = grid_logits[0]
     try:
         print("final grids shape = ", grid_logits.shape)
-        dmc = DiffDMC(dtype=torch.float32).to(grid_logits.device)
-        sdf = -grid_logits / octree_resolution
-        sdf = sdf.to(torch.float32).contiguous()
-        vertices, faces = dmc(sdf, deform=None, return_quads=False, normalize=False)
-        vertices = vertices.detach().cpu().numpy()
-        faces = faces.detach().cpu().numpy()[:, ::-1]        
+        sdf_np = (-grid_logits / octree_resolution).to(torch.float32).detach().cpu().numpy()
+        sdf_np = np.nan_to_num(sdf_np, nan=1.0)
+        vertices, faces, _, _ = measure.marching_cubes(sdf_np, level=0.0)
+        faces = faces[:, ::-1]        
         vertices = vertices / (2 ** octree_depth) * bbox_size + bbox_min
         mesh_v_f = (vertices.astype(np.float32), np.ascontiguousarray(faces))
     except Exception as e:
