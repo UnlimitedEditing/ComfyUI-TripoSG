@@ -665,6 +665,14 @@ class LoadImageFromURL:
     def load(self, url):
         import requests
 
+        if not url.strip():
+            # No URL supplied — return a blank white 512×512 image so
+            # text-only runs (e.g. TripoSG-scribble with prompt only) don't crash.
+            blank = np.ones((512, 512, 3), dtype=np.float32)
+            image = torch.from_numpy(blank).unsqueeze(0)
+            mask  = torch.zeros((1, 512, 512), dtype=torch.float32)
+            return (image, mask)
+
         response = requests.get(url.strip(), timeout=30)
         response.raise_for_status()
 
