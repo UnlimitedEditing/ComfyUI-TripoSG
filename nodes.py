@@ -542,9 +542,11 @@ class SaveTrimesh:
             filename_prefix, save_dir
         )
         output_glb_path = Path(full_output_folder, f"{filename}_{counter:05}_.{file_format}")
-        output_glb_path.parent.mkdir(exist_ok=True)
+        output_glb_path.parent.mkdir(parents=True, exist_ok=True)
 
-        trimesh.export(output_glb_path, file_type=file_format)
+        trimesh.export(str(output_glb_path), file_type=file_format)
+        print(f"[SaveTrimesh] wrote {file_format.upper()} → {output_glb_path} "
+              f"({output_glb_path.stat().st_size} bytes)")
         relative_path = Path(subfolder) / f"{filename}_{counter:05}_.{file_format}"
 
         return (str(relative_path),)
