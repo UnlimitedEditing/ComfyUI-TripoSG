@@ -646,14 +646,14 @@ class BakeVertexColorsFromViews:
         return (out,)
 
 
-class LoadImageFromUrl:
+class LoadImageFromURL:
     """Load an image directly from a URL, bypassing ComfyUI's local-file validation."""
 
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "url": ("STRING", {"default": "", "forceInput": True}),
+                "url": ("STRING", {"default": ""}),
             }
         }
 
@@ -690,7 +690,7 @@ NODE_CLASS_MAPPINGS = {
     "MESHToTrimesh": MESHToTrimesh,
     "TrimeshToMESH": TrimeshToMESH,
     "SaveTrimesh": SaveTrimesh,
-    "LoadImageFromUrl": LoadImageFromUrl,
+    "LoadImageFromURL": LoadImageFromURL,
     "BakeVertexColorsFromViews": BakeVertexColorsFromViews,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -703,6 +703,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MESHToTrimesh": "Mesh to Trimesh",
     "TrimeshToMESH": "Trimesh to Mesh",
     "SaveTrimesh": "Save Trimesh",
-    "LoadImageFromUrl": "Load Image From URL",
+    "LoadImageFromURL": "Load Image From URL",
     "BakeVertexColorsFromViews": "Bake Vertex Colors From Views",
 }
