@@ -549,6 +549,77 @@ class SaveTrimesh:
         return (str(relative_path),)
 
 
+class BakeVertexColorsFromViews:
+    """
+    Orthographic vertex-colour bake from front + optional back view images.
+    Samples pixel colours per vertex using X/Y projection, blended by the
+    vertex normal Z component so front-facing verts get the front image and
+    back-facing verts get the back image with a smooth transition at the sides.
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "trimesh":     ("TRIMESH",),
+                "front_image": ("IMAGE",),
+            },
+            "optional": {
+                "back_image":  ("IMAGE",),
+            },
+        }
+
+    RETURN_TYPES  = ("TRIMESH",)
+    RETURN_NAMES  = ("trimesh",)
+    FUNCTION      = "bake"
+    CATEGORY      = "TripoSG"
+    DESCRIPTION   = ("Bakes front/back view images onto mesh vertices via "
+                     "orthographic projection weighted by vertex normals.")
+
+    def bake(self, trimesh, front_image, back_image=None):
+        verts   = trimesh.vertices        # (N, 3)
+        normals = trimesh.vertex_normals  # (N, 3) — auto-computed
+
+        def to_u8(t):
+            return (t[0].cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+
+        front_np = to_u8(front_image)
+        back_np  = to_u8(back_image) if back_image is not None \
+                   else front_np[:, ::-1, :].copy()   # mirror front as fallback
+
+        # Orthographic UV from vertex XY
+        x, y = verts[:, 0], verts[:, 1]
+        xr = float(x.max() - x.min()) or 1.0
+        yr = float(y.max() - y.min()) or 1.0
+        u  = (x - x.min()) / xr            # 0=left, 1=right
+        v  = 1.0 - (y - y.min()) / yr      # 0=top,  1=bottom
+
+        def sample(img, uc, vc):
+            H, W = img.shape[:2]
+            ix = np.clip((uc * (W - 1)).astype(np.int32), 0, W - 1)
+            iy = np.clip((vc * (H - 1)).astype(np.int32), 0, H - 1)
+            return img[iy, ix]              # (N, 3) uint8
+
+        front_col = sample(front_np, u,       v)
+        back_col  = sample(back_np,  1.0 - u, v)   # mirror X for back view
+
+        # nz=+1 → fully front, nz=-1 → fully back
+        w   = np.clip((normals[:, 2] + 1.0) / 2.0, 0.0, 1.0)[:, np.newaxis]
+        rgb = (front_col.astype(np.float32) * w +
+               back_col.astype(np.float32)  * (1.0 - w)).clip(0, 255).astype(np.uint8)
+
+        alpha         = np.full((len(verts), 1), 255, dtype=np.uint8)
+        vertex_colors = np.concatenate([rgb, alpha], axis=1)   # (N, 4) RGBA
+
+        out = Trimesh.Trimesh(
+            vertices=verts.copy(),
+            faces=trimesh.faces.copy(),
+            vertex_colors=vertex_colors,
+            process=False,
+        )
+        return (out,)
+
+
 class LoadImageFromUrl:
     """Load an image directly from a URL, bypassing ComfyUI's local-file validation."""
 
@@ -594,6 +665,7 @@ NODE_CLASS_MAPPINGS = {
     "TrimeshToMESH": TrimeshToMESH,
     "SaveTrimesh": SaveTrimesh,
     "LoadImageFromUrl": LoadImageFromUrl,
+    "BakeVertexColorsFromViews": BakeVertexColorsFromViews,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "TripoSGModelLoader": "TripoSG Model Loader",
@@ -606,4 +678,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TrimeshToMESH": "Trimesh to Mesh",
     "SaveTrimesh": "Save Trimesh",
     "LoadImageFromUrl": "Load Image From URL",
+    "BakeVertexColorsFromViews": "Bake Vertex Colors From Views",
 }
