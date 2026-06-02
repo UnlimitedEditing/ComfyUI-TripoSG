@@ -328,7 +328,9 @@ class TripoSGPrepareImage:
             white_mask = np.all(image_np >= 250, axis=2)
             alpha = np.where(white_mask, 0, 255).astype(np.uint8)
             if not is_valid_alpha(alpha):
-                raise ValueError("Image has no valid alpha channel, please provide a mask.")
+                # No valid subject found (e.g. blank canvas for text-only scribble).
+                # Fall back to treating the entire image as the subject.
+                alpha = np.full(image_np.shape[:2], 255, dtype=np.uint8)
 
         if alpha is None:
             if mask.ndim == 3:
