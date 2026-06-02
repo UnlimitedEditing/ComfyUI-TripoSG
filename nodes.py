@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 import torch
 import trimesh as Trimesh
+from io import BytesIO
 from pathlib import Path
 from huggingface_hub import snapshot_download
 from PIL import Image
@@ -548,6 +549,39 @@ class SaveTrimesh:
         return (str(relative_path),)
 
 
+class LoadImageFromUrl:
+    """Load an image directly from a URL, bypassing ComfyUI's local-file validation."""
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "url": ("STRING", {"default": "", "forceInput": True}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ("image", "mask")
+    FUNCTION = "load"
+    CATEGORY = "TripoSG"
+
+    def load(self, url):
+        import requests
+
+        response = requests.get(url.strip(), timeout=30)
+        response.raise_for_status()
+
+        img = Image.open(BytesIO(response.content)).convert("RGBA")
+        arr = np.array(img).astype(np.float32) / 255.0
+
+        # IMAGE: [1, H, W, 3] RGB float32 0–1
+        image = torch.from_numpy(arr[:, :, :3]).unsqueeze(0)
+        # MASK: [1, H, W] ComfyUI convention — 0 = opaque, 1 = transparent
+        mask = torch.from_numpy(1.0 - arr[:, :, 3]).unsqueeze(0)
+
+        return (image, mask)
+
+
 # Node registration
 NODE_CLASS_MAPPINGS = {
     "TripoSGModelLoader": TripoSGModelLoader,
@@ -559,6 +593,7 @@ NODE_CLASS_MAPPINGS = {
     "MESHToTrimesh": MESHToTrimesh,
     "TrimeshToMESH": TrimeshToMESH,
     "SaveTrimesh": SaveTrimesh,
+    "LoadImageFromUrl": LoadImageFromUrl,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "TripoSGModelLoader": "TripoSG Model Loader",
@@ -570,4 +605,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MESHToTrimesh": "Mesh to Trimesh",
     "TrimeshToMESH": "Trimesh to Mesh",
     "SaveTrimesh": "Save Trimesh",
+    "LoadImageFromUrl": "Load Image From URL",
 }
