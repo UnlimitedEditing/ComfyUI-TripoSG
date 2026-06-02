@@ -194,8 +194,7 @@ class TripoSGInference:
             if not isinstance(conditioning, TripoSGScribbleConditioning):
                 raise ValueError("Conditioning must be a TripoSGScribbleConditioning")
 
-            if not conditioning.prompt:
-                raise ValueError("Prompt is required for TripoSGScribblePipeline")
+            # Empty prompt is allowed — text encoder handles "" as no text guidance
 
             outputs = model(
                 image=pil_image,
