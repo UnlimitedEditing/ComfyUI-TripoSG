@@ -587,12 +587,26 @@ class BakeVertexColorsFromViews:
         back_np  = to_u8(back_image) if back_image is not None \
                    else front_np[:, ::-1, :].copy()   # mirror front as fallback
 
-        # Orthographic UV from vertex XY
+        # --- UV mapping that matches TripoSGPrepareImage exactly ----------------
+        # PrepareImage squares the image based on the dominant dimension and adds
+        # pad_ratio (10 %) padding on every side.  The mesh XY bounds correspond
+        # to the *character content*, not the full image, so we must push the UV
+        # inward by pad_ratio and correct for the non-dominant axis being centred.
+        pad = 0.1   # must match TripoSGPrepareImage.pad_ratio
         x, y = verts[:, 0], verts[:, 1]
         xr = float(x.max() - x.min()) or 1.0
         yr = float(y.max() - y.min()) or 1.0
-        u  = (x - x.min()) / xr            # 0=left, 1=right
-        v  = 1.0 - (y - y.min()) / yr      # 0=top,  1=bottom
+        inner = 1.0 - 2.0 * pad   # fraction of image occupied by the character
+
+        if xr <= yr:   # tall / square — Y is the dominant (full-height) dimension
+            v = pad + (1.0 - (y - y.min()) / yr) * inner
+            x_span = (xr / yr) * inner          # proportional width in UV space
+            u = 0.5 - x_span * 0.5 + (x - x.min()) / xr * x_span
+        else:           # wide — X is the dominant (full-width) dimension
+            u = pad + (x - x.min()) / xr * inner
+            y_span = (yr / xr) * inner
+            v = 0.5 - y_span * 0.5 + (1.0 - (y - y.min()) / yr) * y_span
+        # ------------------------------------------------------------------------
 
         def sample(img, uc, vc):
             H, W = img.shape[:2]
