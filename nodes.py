@@ -563,6 +563,12 @@ class BakeVertexColorsFromViews:
             "required": {
                 "trimesh":     ("TRIMESH",),
                 "front_image": ("IMAGE",),
+                "cam_dist": ("FLOAT", {
+                    "default": 2.5, "min": 0.5, "max": 10.0, "step": 0.1,
+                    "tooltip": "Virtual camera distance along +Z. Controls perspective correction depth. "
+                               "Increase if texture is too zoomed on edges; decrease if too stretched. "
+                               "Match to TripoSG training camera (~2.0-3.5)."
+                }),
             },
             "optional": {
                 "back_image":  ("IMAGE",),
@@ -576,7 +582,7 @@ class BakeVertexColorsFromViews:
     DESCRIPTION   = ("Bakes front/back view images onto mesh vertices via "
                      "orthographic projection weighted by vertex normals.")
 
-    def bake(self, trimesh, front_image, back_image=None):
+    def bake(self, trimesh, front_image, back_image=None, cam_dist=2.5):
         verts   = trimesh.vertices        # (N, 3)
         normals = trimesh.vertex_normals  # (N, 3) — auto-computed
 
@@ -587,25 +593,31 @@ class BakeVertexColorsFromViews:
         back_np  = to_u8(back_image) if back_image is not None \
                    else front_np[:, ::-1, :].copy()   # mirror front as fallback
 
-        # --- UV mapping that matches TripoSGPrepareImage exactly ----------------
-        # PrepareImage squares the image based on the dominant dimension and adds
-        # pad_ratio (10 %) padding on every side.  The mesh XY bounds correspond
-        # to the *character content*, not the full image, so we must push the UV
-        # inward by pad_ratio and correct for the non-dominant axis being centred.
-        pad = 0.1   # must match TripoSGPrepareImage.pad_ratio
-        x, y = verts[:, 0], verts[:, 1]
-        xr = float(x.max() - x.min()) or 1.0
-        yr = float(y.max() - y.min()) or 1.0
-        inner = 1.0 - 2.0 * pad   # fraction of image occupied by the character
+        # --- Perspective projection onto the Z=0 reference plane ----------------
+        # Orthographic (raw XY) is perfect at the closest face but drifts with Z
+        # depth because the source image was rendered with a perspective camera.
+        # Dividing by (cam_dist - z) and rescaling to z=0 undoes foreshortening.
+        z     = verts[:, 2]
+        depth = np.maximum(cam_dist - z, 1e-3)        # never divide by zero
+        x_p   = verts[:, 0] / depth * cam_dist        # perspective-correct X
+        y_p   = verts[:, 1] / depth * cam_dist        # perspective-correct Y
 
-        if xr <= yr:   # tall / square — Y is the dominant (full-height) dimension
-            v = pad + (1.0 - (y - y.min()) / yr) * inner
-            x_span = (xr / yr) * inner          # proportional width in UV space
-            u = 0.5 - x_span * 0.5 + (x - x.min()) / xr * x_span
-        else:           # wide — X is the dominant (full-width) dimension
-            u = pad + (x - x.min()) / xr * inner
+        # --- UV mapping that matches TripoSGPrepareImage exactly ----------------
+        # PrepareImage adds pad_ratio (10 %) on every side and squares by the
+        # dominant dimension — replicate that here on the projected coords.
+        pad   = 0.1
+        inner = 1.0 - 2.0 * pad
+        xr = float(x_p.max() - x_p.min()) or 1.0
+        yr = float(y_p.max() - y_p.min()) or 1.0
+
+        if xr <= yr:   # tall / square — Y dominant
+            v      = pad + (1.0 - (y_p - y_p.min()) / yr) * inner
+            x_span = (xr / yr) * inner
+            u      = 0.5 - x_span * 0.5 + (x_p - x_p.min()) / xr * x_span
+        else:           # wide — X dominant
+            u      = pad + (x_p - x_p.min()) / xr * inner
             y_span = (yr / xr) * inner
-            v = 0.5 - y_span * 0.5 + (1.0 - (y - y.min()) / yr) * y_span
+            v      = 0.5 - y_span * 0.5 + (1.0 - (y_p - y_p.min()) / yr) * y_span
         # ------------------------------------------------------------------------
 
         def sample(img, uc, vc):
