@@ -1,27 +1,38 @@
 import os
-import cv2
 import numpy as np
 import torch
-import trimesh as Trimesh
 from io import BytesIO
 from pathlib import Path
-from huggingface_hub import snapshot_download
 from PIL import Image
 from typing import Dict, Any
 
 import folder_paths
 import comfy.utils
 import comfy.model_management as mm
-from comfy_extras.nodes_hunyuan3d import MESH
-
-# Import pipeline classes
-from .triposg.pipelines.pipeline_triposg import TripoSGPipeline
-from .triposg.pipelines.pipeline_triposg_scribble import TripoSGScribblePipeline
-from .partcrafter.pipelines.pipeline_partcrafter import PartCrafterPipeline
-from .partcrafter.utils.data_utils import get_colored_mesh_composition, scene_to_parts, load_surfaces
 
 gpu = mm.get_torch_device()
 cpu = torch.device("cpu")
+
+# Heavy 3D pipeline imports — optional.
+# LoadImageFromURL and LoadVideoFromURL work without them.
+_TRIPOSG_AVAILABLE = False
+try:
+    import cv2
+    import trimesh as Trimesh
+    from huggingface_hub import snapshot_download
+    from comfy_extras.nodes_hunyuan3d import MESH
+    from .triposg.pipelines.pipeline_triposg import TripoSGPipeline
+    from .triposg.pipelines.pipeline_triposg_scribble import TripoSGScribblePipeline
+    from .partcrafter.pipelines.pipeline_partcrafter import PartCrafterPipeline
+    from .partcrafter.utils.data_utils import (
+        get_colored_mesh_composition, scene_to_parts, load_surfaces,
+    )
+    _TRIPOSG_AVAILABLE = True
+except ImportError as e:
+    print(
+        f"[ComfyUI-TripoSG] 3D pipeline unavailable ({e}); "
+        "LoadImageFromURL and LoadVideoFromURL still active."
+    )
 
 
 def pil2numpy(image: Image.Image):
@@ -40,7 +51,7 @@ def tensor2pil(image: torch.Tensor, mode=None):
     return numpy2pil(image.cpu().numpy().squeeze(), mode=mode)
 
 
-def simplify_mesh(mesh: MESH, n_faces: int):
+def simplify_mesh(mesh, n_faces: int):
     # Assume mesh.vertices: (1, N, 3), mesh.faces: (1, M, 3)
     v = mesh.vertices[0].cpu().numpy()
     f = mesh.faces[0].cpu().numpy()
@@ -516,40 +527,46 @@ class MESHToTrimesh:
 
 
 class SaveTrimesh:
+    _FORMATS = ["glb", "obj", "ply", "stl", "3mf", "dae"]
+
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
                 "trimesh": ("TRIMESH",),
                 "filename_prefix": ("STRING", {"default": "3D/TripoSG"}),
-                "file_format": (["glb", "obj", "ply", "stl", "3mf", "dae"],),
+                "file_format": (SaveTrimesh._FORMATS,),
             },
             "optional": {
+                "also_save": (["none"] + SaveTrimesh._FORMATS, {"default": "none"}),
                 "save_file": ("BOOLEAN", {"default": True, "label_on": "output", "label_off": "temp"}),
             },
         }
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("glb_path",)
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("file_path", "also_path")
     FUNCTION = "process"
     CATEGORY = "TripoSG"
     OUTPUT_NODE = True
-    DESCRIPTION = "Export trimesh object to model file"
+    DESCRIPTION = "Export trimesh object to one or two model files simultaneously"
 
-    def process(self, trimesh, filename_prefix, file_format, save_file=True):
+    def process(self, trimesh, filename_prefix, file_format, also_save="none", save_file=True):
         save_dir = folder_paths.get_output_directory() if save_file else folder_paths.get_temp_directory()
         full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(
             filename_prefix, save_dir
         )
-        output_glb_path = Path(full_output_folder, f"{filename}_{counter:05}_.{file_format}")
-        output_glb_path.parent.mkdir(parents=True, exist_ok=True)
 
-        trimesh.export(str(output_glb_path), file_type=file_format)
-        print(f"[SaveTrimesh] wrote {file_format.upper()} → {output_glb_path} "
-              f"({output_glb_path.stat().st_size} bytes)")
-        relative_path = Path(subfolder) / f"{filename}_{counter:05}_.{file_format}"
+        def write(fmt):
+            path = Path(full_output_folder, f"{filename}_{counter:05}_.{fmt}")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            trimesh.export(str(path), file_type=fmt)
+            print(f"[SaveTrimesh] wrote {fmt.upper()} → {path} ({path.stat().st_size} bytes)")
+            return str(Path(subfolder) / f"{filename}_{counter:05}_.{fmt}")
 
-        return (str(relative_path),)
+        primary_path = write(file_format)
+        also_path = write(also_save) if also_save != "none" and also_save != file_format else ""
+
+        return (primary_path, also_path)
 
 
 class BakeVertexColorsFromViews:
@@ -572,6 +589,10 @@ class BakeVertexColorsFromViews:
                                "Increase if texture is too zoomed on edges; decrease if too stretched. "
                                "Match to TripoSG training camera (~2.0-3.5)."
                 }),
+                "back_image_url": ("STRING", {
+                    "default": "",
+                    "tooltip": "Optional URL for a back-view image. Leave empty to mirror the front image."
+                }),
             },
             "optional": {
                 "back_image":  ("IMAGE",),
@@ -585,7 +606,7 @@ class BakeVertexColorsFromViews:
     DESCRIPTION   = ("Bakes front/back view images onto mesh vertices via "
                      "orthographic projection weighted by vertex normals.")
 
-    def bake(self, trimesh, front_image, back_image=None, cam_dist=2.5):
+    def bake(self, trimesh, front_image, cam_dist=2.5, back_image_url="", back_image=None):
         verts   = trimesh.vertices        # (N, 3)
         normals = trimesh.vertex_normals  # (N, 3) — auto-computed
 
@@ -593,8 +614,16 @@ class BakeVertexColorsFromViews:
             return (t[0].cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
 
         front_np = to_u8(front_image)
-        back_np  = to_u8(back_image) if back_image is not None \
-                   else front_np[:, ::-1, :].copy()   # mirror front as fallback
+        if back_image is not None:
+            back_np = to_u8(back_image)
+        elif back_image_url and back_image_url.strip():
+            import requests as _requests
+            resp = _requests.get(back_image_url.strip(), timeout=30)
+            resp.raise_for_status()
+            back_pil = Image.open(BytesIO(resp.content)).convert("RGB")
+            back_np = np.array(back_pil).astype(np.uint8)
+        else:
+            back_np = front_np[:, ::-1, :].copy()   # mirror front as fallback
 
         # --- Perspective projection onto the Z=0 reference plane ----------------
         # Orthographic (raw XY) is perfect at the closest face but drifts with Z
@@ -690,30 +719,101 @@ class LoadImageFromURL:
         return (image, mask)
 
 
-# Node registration
+class LoadVideoFromURL:
+    """Download a video from URL and decode frames as an IMAGE batch."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "url":        ("STRING",  {"default": ""}),
+                "max_frames": ("INT",     {"default": 81,   "min": 1,   "max": 1000}),
+                "fps":        ("FLOAT",   {"default": 16.0, "min": 1.0, "max": 60.0}),
+                "width":      ("INT",     {"default": 832,  "min": 64,  "max": 4096, "step": 8}),
+                "height":     ("INT",     {"default": 480,  "min": 64,  "max": 4096, "step": 8}),
+            }
+        }
+
+    RETURN_TYPES  = ("IMAGE",)
+    RETURN_NAMES  = ("frames",)
+    FUNCTION      = "load"
+    CATEGORY      = "TripoSG"
+
+    def load(self, url, max_frames=81, fps=16.0, width=832, height=480):
+        import requests
+        import shutil
+        import subprocess
+        import tempfile
+
+        if not url.strip():
+            blank = np.zeros((max_frames, height, width, 3), dtype=np.float32)
+            return (torch.from_numpy(blank),)
+
+        tmp_dir    = tempfile.mkdtemp()
+        tmp_video  = os.path.join(tmp_dir, "input.mp4")
+        frames_dir = os.path.join(tmp_dir, "frames")
+        os.makedirs(frames_dir)
+
+        try:
+            resp = requests.get(url.strip(), timeout=120, stream=True)
+            resp.raise_for_status()
+            with open(tmp_video, "wb") as fh:
+                for chunk in resp.iter_content(chunk_size=65536):
+                    fh.write(chunk)
+
+            subprocess.check_call([
+                "ffmpeg", "-y", "-i", tmp_video,
+                "-vf", f"fps={fps},scale={width}:{height}:flags=lanczos",
+                "-frames:v", str(max_frames),
+                "-pix_fmt", "rgb24", "-f", "image2",
+                os.path.join(frames_dir, "frame_%05d.png"),
+            ], stderr=subprocess.DEVNULL)
+
+            frame_paths = sorted(Path(frames_dir).glob("frame_*.png"))
+            if not frame_paths:
+                raise RuntimeError("ffmpeg produced no frames from the video")
+
+            frames = [np.array(Image.open(p).convert("RGB")) for p in frame_paths[:max_frames]]
+            while len(frames) < max_frames:
+                frames.append(frames[-1])
+
+            return (torch.from_numpy(np.stack(frames).astype(np.float32) / 255.0),)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# Node registration — URL loaders always available; 3D nodes require full pip deps
 NODE_CLASS_MAPPINGS = {
-    "TripoSGModelLoader": TripoSGModelLoader,
-    "TripoSGInference": TripoSGInference,
-    "TripoSGPrepareImage": TripoSGPrepareImage,
-    "TripoSGConditioning": TripoSGScribbleConditioningNode,
-    "PartCrafterConditioning": PartCrafterConditioningNode,
-    "SimplifyMesh": SimplifyMesh,
-    "MESHToTrimesh": MESHToTrimesh,
-    "TrimeshToMESH": TrimeshToMESH,
-    "SaveTrimesh": SaveTrimesh,
     "LoadImageFromURL": LoadImageFromURL,
-    "BakeVertexColorsFromViews": BakeVertexColorsFromViews,
+    "LoadVideoFromURL": LoadVideoFromURL,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "TripoSGModelLoader": "TripoSG Model Loader",
-    "TripoSGInference": "TripoSG Inference",
-    "TripoSGConditioning": "TripoSG Scribble Conditioning",
-    "PartCrafterConditioning": "PartCrafter Conditioning",
-    "TripoSGPrepareImage": "TripoSG Prepare Image",
-    "SimplifyMesh": "Simplify Mesh",
-    "MESHToTrimesh": "Mesh to Trimesh",
-    "TrimeshToMESH": "Trimesh to Mesh",
-    "SaveTrimesh": "Save Trimesh",
     "LoadImageFromURL": "Load Image From URL",
-    "BakeVertexColorsFromViews": "Bake Vertex Colors From Views",
+    "LoadVideoFromURL": "Load Video From URL",
 }
+
+if _TRIPOSG_AVAILABLE:
+    NODE_CLASS_MAPPINGS.update({
+        "TripoSGModelLoader": TripoSGModelLoader,
+        "TripoSGInference": TripoSGInference,
+        "TripoSGPrepareImage": TripoSGPrepareImage,
+        "TripoSGConditioning": TripoSGScribbleConditioningNode,
+        "PartCrafterConditioning": PartCrafterConditioningNode,
+        "SimplifyMesh": SimplifyMesh,
+        "MESHToTrimesh": MESHToTrimesh,
+        "TrimeshToMESH": TrimeshToMESH,
+        "SaveTrimesh": SaveTrimesh,
+        "BakeVertexColorsFromViews": BakeVertexColorsFromViews,
+    })
+    NODE_DISPLAY_NAME_MAPPINGS.update({
+        "TripoSGModelLoader": "TripoSG Model Loader",
+        "TripoSGInference": "TripoSG Inference",
+        "TripoSGConditioning": "TripoSG Scribble Conditioning",
+        "PartCrafterConditioning": "PartCrafter Conditioning",
+        "TripoSGPrepareImage": "TripoSG Prepare Image",
+        "SimplifyMesh": "Simplify Mesh",
+        "MESHToTrimesh": "Mesh to Trimesh",
+        "TrimeshToMESH": "Trimesh to Mesh",
+        "SaveTrimesh": "Save Trimesh",
+        "BakeVertexColorsFromViews": "Bake Vertex Colors From Views",
+    })
