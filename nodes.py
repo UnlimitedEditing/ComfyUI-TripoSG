@@ -782,14 +782,345 @@ class LoadVideoFromURL:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+# ── Shared helpers ────────────────────────────────────────────────────────────
+
+def _render_text_card(text: str, title: str = "", width: int = 1200) -> torch.Tensor:
+    """Render a string as a dark-themed card IMAGE tensor [1,H,W,3]."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    LINE_H, HEADER_H, PADDING = 30, 70, 40
+    lines = text.splitlines()
+    card_h = max(600, HEADER_H + len(lines) * LINE_H + PADDING)
+
+    img  = Image.new("RGB", (width, card_h), color=(11, 14, 18))
+    draw = ImageDraw.Draw(img)
+
+    try:
+        font_title = ImageFont.load_default(size=22)
+        font_body  = ImageFont.load_default(size=16)
+    except TypeError:
+        font_title = font_body = ImageFont.load_default()
+
+    if title:
+        draw.text((PADDING, 16), title, fill=(108, 71, 255), font=font_title)
+    draw.line([(PADDING, 56), (width - PADDING, 56)], fill=(30, 33, 40), width=1)
+
+    y = HEADER_H
+    for line in lines:
+        draw.text((PADDING, y), line, fill=(210, 215, 225), font=font_body)
+        y += LINE_H
+        if y > card_h - LINE_H:
+            draw.text((PADDING, y), "… (truncated)", fill=(60, 70, 90), font=font_body)
+            break
+
+    arr = np.array(img).astype(np.float32) / 255.0
+    return torch.from_numpy(arr).unsqueeze(0)
+
+
+def _encode_string_as_image(text: str) -> torch.Tensor:
+    """Losslessly encode a UTF-8 string as an RGB IMAGE tensor.
+    Format: 4-byte big-endian length header + UTF-8 bytes, 3 bytes per pixel.
+    ForgeExpress decodes by reading pixel values back to bytes."""
+    import math
+    import struct
+
+    payload = struct.pack(">I", len(text.encode("utf-8"))) + text.encode("utf-8")
+    while len(payload) % 3:
+        payload += b"\x00"
+
+    n_pixels = len(payload) // 3
+    side     = max(1, math.ceil(math.sqrt(n_pixels)))
+    padded   = payload + b"\x00" * (side * side * 3 - len(payload))
+
+    arr = np.frombuffer(padded, dtype=np.uint8).reshape(side, side, 3).astype(np.float32) / 255.0
+    return torch.from_numpy(arr).unsqueeze(0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TranscribeAudioFromURL:
+    """Download audio from URL and transcribe to timed lyrics using faster-whisper.
+    Returns a lyrics card IMAGE (suitable as Graydient workflow output) and the raw JSON STRING."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "url":        ("STRING", {"default": ""}),
+                "model_size": (["large-v3", "medium", "small", "base"], {}),
+                "language":   ("STRING", {"default": ""}),
+            }
+        }
+
+    RETURN_TYPES  = ("IMAGE", "STRING")
+    RETURN_NAMES  = ("lyrics_card", "lyrics_json")
+    FUNCTION      = "transcribe"
+    CATEGORY      = "TripoSG"
+
+    def transcribe(self, url, model_size="large-v3", language=""):
+        import json
+        import os
+        import shutil
+        import tempfile
+
+        import requests
+        import torch
+        from PIL import Image, ImageDraw, ImageFont
+
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError:
+            raise RuntimeError(
+                "faster-whisper not installed. Add 'faster-whisper' to the workflow's pip requirements."
+            )
+
+        # ── Download audio ────────────────────────────────────────────────────
+        tmp_dir  = tempfile.mkdtemp()
+        # Keep original extension so ffmpeg/whisper can sniff format
+        ext      = os.path.splitext(url.strip().split("?")[0])[-1] or ".mp3"
+        tmp_path = os.path.join(tmp_dir, f"audio{ext}")
+
+        try:
+            resp = requests.get(url.strip(), timeout=120, stream=True)
+            resp.raise_for_status()
+            with open(tmp_path, "wb") as fh:
+                for chunk in resp.iter_content(chunk_size=65536):
+                    fh.write(chunk)
+
+            # ── Transcribe ────────────────────────────────────────────────────
+            device       = "cuda" if torch.cuda.is_available() else "cpu"
+            compute_type = "float16" if device == "cuda" else "int8"
+            model = WhisperModel(model_size, device=device, compute_type=compute_type)
+
+            lang   = language.strip() if language.strip() else None
+            segs, info = model.transcribe(tmp_path, language=lang, beam_size=5, word_timestamps=False)
+            segments = [{"start": round(s.start, 2), "end": round(s.end, 2), "text": s.text.strip()}
+                        for s in segs]
+
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        lyrics_data = {
+            "language": info.language,
+            "duration": round(info.duration, 2),
+            "segments": segments,
+        }
+        lyrics_json = json.dumps(lyrics_data, indent=2, ensure_ascii=False)
+
+        # ── Render lyrics card ────────────────────────────────────────────────
+        CARD_W      = 1200
+        LINE_H      = 36
+        HEADER_H    = 70
+        PADDING     = 40
+        card_h      = max(600, HEADER_H + len(segments) * LINE_H + PADDING)
+
+        img  = Image.new("RGB", (CARD_W, card_h), color=(11, 14, 18))
+        draw = ImageDraw.Draw(img)
+
+        try:
+            font_ts   = ImageFont.load_default(size=17)
+            font_text = ImageFont.load_default(size=19)
+            font_hdr  = ImageFont.load_default(size=22)
+        except TypeError:
+            # Older Pillow without size arg — use bitmap default
+            font_ts = font_text = font_hdr = ImageFont.load_default()
+
+        # Header
+        meta = f"lang:{info.language}  dur:{info.duration:.1f}s  segs:{len(segments)}"
+        draw.text((PADDING, 16), "TIMED LYRICS", fill=(108, 71, 255), font=font_hdr)
+        draw.text((PADDING + 280, 20), meta, fill=(80, 90, 110), font=font_ts)
+        draw.line([(PADDING, 56), (CARD_W - PADDING, 56)], fill=(30, 33, 40), width=1)
+
+        # Segments
+        y = HEADER_H
+        for seg in segments:
+            s, e = seg["start"], seg["end"]
+            ts = f"[{int(s)//60:02d}:{s%60:05.2f}→{int(e)//60:02d}:{e%60:05.2f}]"
+            draw.text((PADDING, y), ts, fill=(108, 71, 255), font=font_ts)
+            draw.text((PADDING + 320, y), seg["text"], fill=(210, 215, 225), font=font_text)
+            y += LINE_H
+            if y > card_h - LINE_H:
+                draw.text((PADDING, y), "… (truncated)", fill=(60, 70, 90), font=font_ts)
+                break
+
+        img_np = np.array(img).astype(np.float32) / 255.0
+        img_t  = torch.from_numpy(img_np).unsqueeze(0)   # [1, H, W, 3]
+
+        return (img_t, lyrics_json)
+
+
+class HFTextGenerate:
+    """Run text-only inference with any HuggingFace instruction-tuned model.
+    Returns the response as a STRING and as an encoded data IMAGE (for Graydient output).
+    Default model: Qwen/Qwen2.5-7B-Instruct (~15 GB)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model_id":       ("STRING", {"default": "Qwen/Qwen2.5-7B-Instruct"}),
+                "system_prompt":  ("STRING", {"multiline": True,
+                                              "default": "You are a helpful assistant. Respond with valid JSON only."}),
+                "user_prompt":    ("STRING", {"multiline": True, "default": ""}),
+                "max_new_tokens": ("INT",    {"default": 2048, "min": 64, "max": 8192}),
+                "temperature":    ("FLOAT",  {"default": 0.3,  "min": 0.0, "max": 2.0, "step": 0.05}),
+            }
+        }
+
+    RETURN_TYPES  = ("STRING", "IMAGE", "IMAGE")
+    RETURN_NAMES  = ("response_text", "response_card", "response_data")
+    FUNCTION      = "generate"
+    CATEGORY      = "TripoSG"
+
+    def generate(self, model_id, system_prompt, user_prompt, max_new_tokens, temperature):
+        import torch
+
+        try:
+            from transformers import pipeline as hf_pipeline
+        except ImportError:
+            raise RuntimeError("transformers not installed.")
+
+        device     = "cuda" if torch.cuda.is_available() else "cpu"
+        dtype      = torch.bfloat16 if device == "cuda" else torch.float32
+
+        pipe = hf_pipeline(
+            "text-generation",
+            model=model_id,
+            torch_dtype=dtype,
+            device_map="auto",
+        )
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_prompt},
+        ]
+
+        do_sample = temperature > 0
+        out = pipe(
+            messages,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature if do_sample else None,
+            do_sample=do_sample,
+        )
+        response = out[0]["generated_text"][-1]["content"]
+
+        del pipe
+        if device == "cuda":
+            torch.cuda.empty_cache()
+
+        card = _render_text_card(response, title=f"LLM: {model_id.split('/')[-1]}")
+        data = _encode_string_as_image(response)
+        return (response, card, data)
+
+
+class VLMInferFromURL:
+    """Multimodal inference with Qwen2.5-VL (or Qwen2-VL) on an image from URL.
+    Returns the response as STRING, a readable card IMAGE, and an encoded data IMAGE.
+    Default model: Qwen/Qwen2.5-VL-7B-Instruct (~15 GB)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image_url":      ("STRING", {"default": ""}),
+                "model_id":       ("STRING", {"default": "Qwen/Qwen2.5-VL-7B-Instruct"}),
+                "system_prompt":  ("STRING", {"multiline": True,
+                                              "default": "You are a helpful assistant. Respond with valid JSON only."}),
+                "user_prompt":    ("STRING", {"multiline": True, "default": "Describe this image."}),
+                "max_new_tokens": ("INT",    {"default": 2048, "min": 64, "max": 4096}),
+            }
+        }
+
+    RETURN_TYPES  = ("STRING", "IMAGE", "IMAGE")
+    RETURN_NAMES  = ("response_text", "response_card", "response_data")
+    FUNCTION      = "infer"
+    CATEGORY      = "TripoSG"
+
+    def infer(self, image_url, model_id, system_prompt, user_prompt, max_new_tokens):
+        import torch
+
+        try:
+            from qwen_vl_utils import process_vision_info
+        except ImportError:
+            raise RuntimeError("qwen-vl-utils not installed. Add 'qwen-vl-utils' to pip requirements.")
+
+        # Support both Qwen2-VL and Qwen2.5-VL
+        try:
+            from transformers import Qwen2_5_VLForConditionalGeneration as QwenVLModel
+        except ImportError:
+            from transformers import Qwen2VLForConditionalGeneration as QwenVLModel
+        from transformers import AutoProcessor
+
+        model = QwenVLModel.from_pretrained(
+            model_id, torch_dtype=torch.bfloat16, device_map="auto"
+        )
+        processor = AutoProcessor.from_pretrained(model_id)
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image_url},
+                    {"type": "text",  "text":  user_prompt},
+                ],
+            },
+        ]
+
+        text_input  = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        img_inputs, vid_inputs = process_vision_info(messages)
+        inputs = processor(
+            text=[text_input], images=img_inputs, videos=vid_inputs,
+            padding=True, return_tensors="pt",
+        ).to(model.device)
+
+        with torch.no_grad():
+            gen_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
+
+        trimmed  = [g[len(i):] for i, g in zip(inputs.input_ids, gen_ids)]
+        response = processor.batch_decode(trimmed, skip_special_tokens=True)[0]
+
+        del model, processor, inputs
+        torch.cuda.empty_cache()
+
+        card = _render_text_card(response, title=f"VLM: {model_id.split('/')[-1]}")
+        data = _encode_string_as_image(response)
+        return (response, card, data)
+
+
+class EncodeStringAsImage:
+    """Encode a STRING as a lossless RGB data IMAGE for Graydient output.
+    ForgeExpress decodes it by reading pixel values back to UTF-8 bytes."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"text": ("STRING", {"multiline": True, "default": ""})}}
+
+    RETURN_TYPES  = ("IMAGE",)
+    RETURN_NAMES  = ("data_image",)
+    FUNCTION      = "encode"
+    CATEGORY      = "TripoSG"
+
+    def encode(self, text):
+        return (_encode_string_as_image(text),)
+
+
 # Node registration — URL loaders always available; 3D nodes require full pip deps
 NODE_CLASS_MAPPINGS = {
-    "LoadImageFromURL": LoadImageFromURL,
-    "LoadVideoFromURL": LoadVideoFromURL,
+    "LoadImageFromURL":       LoadImageFromURL,
+    "LoadVideoFromURL":       LoadVideoFromURL,
+    "TranscribeAudioFromURL": TranscribeAudioFromURL,
+    "HFTextGenerate":         HFTextGenerate,
+    "VLMInferFromURL":        VLMInferFromURL,
+    "EncodeStringAsImage":    EncodeStringAsImage,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "LoadImageFromURL": "Load Image From URL",
-    "LoadVideoFromURL": "Load Video From URL",
+    "LoadImageFromURL":       "Load Image From URL",
+    "LoadVideoFromURL":       "Load Video From URL",
+    "TranscribeAudioFromURL": "Transcribe Audio From URL",
+    "HFTextGenerate":         "HF Text Generate",
+    "VLMInferFromURL":        "VLM Infer From URL",
+    "EncodeStringAsImage":    "Encode String As Image",
 }
 
 if _TRIPOSG_AVAILABLE:
