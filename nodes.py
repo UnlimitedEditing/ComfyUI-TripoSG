@@ -894,8 +894,13 @@ class TranscribeAudioFromURL:
 
             lang   = language.strip() if language.strip() else None
             raw, info = model.transcribe(
-                tmp_path, language=lang, beam_size=5, word_timestamps=False,
-                no_speech_threshold=0.6,  # built-in: drops segments Whisper marks as non-vocal
+                tmp_path,
+                language              = lang,
+                beam_size             = 5,
+                word_timestamps       = False,
+                no_speech_threshold   = 0.6,
+                temperature           = 0,      # greedy — kills hallucination fallback on music
+                condition_on_previous_text = False,  # stops snowball hallucination between segments
             )
             lyrical = [
                 {"start": round(s.start, 2), "end": round(s.end, 2), "text": s.text.strip()}
