@@ -897,18 +897,31 @@ class TranscribeAudioFromURL:
                 tmp_path,
                 language               = lang,
                 beam_size              = 5,
-                word_timestamps        = False,
-                # Default temperature schedule gives best lyric coverage on music.
-                # condition_on_previous_text=False prevents context snowball hallucination.
-                # no_speech_threshold=0.7 catches instrumental sections aggressively enough
-                # to filter the outro without cutting real vocals.
+                # word_timestamps=True: use actual word boundaries rather than Whisper's
+                # segment-level timestamps. This fixes the "intro declared as speech"
+                # problem where Whisper reports a segment starting at 0:00 even when the
+                # first word is at 0:12 — giving gap detection a real gap to work with.
+                word_timestamps            = True,
                 no_speech_threshold        = 0.7,
                 condition_on_previous_text = False,
             )
-            lyrical = [
-                {"start": round(s.start, 2), "end": round(s.end, 2), "text": s.text.strip()}
-                for s in raw if s.text.strip()
-            ]
+            lyrical = []
+            for s in raw:
+                text = s.text.strip()
+                if not text:
+                    continue
+                # Adjust start/end to actual word boundaries if available
+                if s.words:
+                    seg_start = s.words[0].start
+                    seg_end   = s.words[-1].end
+                else:
+                    seg_start = s.start
+                    seg_end   = s.end
+                lyrical.append({
+                    "start": round(seg_start, 2),
+                    "end":   round(seg_end,   2),
+                    "text":  text,
+                })
 
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
