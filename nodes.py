@@ -895,12 +895,20 @@ class TranscribeAudioFromURL:
             lang   = language.strip() if language.strip() else None
             raw, info = model.transcribe(
                 tmp_path,
-                language              = lang,
-                beam_size             = 5,
-                word_timestamps       = False,
-                no_speech_threshold   = 0.6,
-                temperature           = 0,      # greedy — kills hallucination fallback on music
-                condition_on_previous_text = False,  # stops snowball hallucination between segments
+                language               = lang,
+                beam_size              = 5,
+                word_timestamps        = False,
+                no_speech_threshold    = 0.6,
+                temperature            = 0,     # greedy — no hallucination fallback
+                condition_on_previous_text = False,
+                # VAD pre-filters music/silence so Whisper only sees real speech.
+                # This prevents the 2-minute context-overflow hallucination cliff
+                # and naturally produces instrumental gaps without a manual scanner.
+                vad_filter             = True,
+                vad_parameters         = dict(
+                    min_silence_duration_ms = 500,  # gaps < 500ms stay joined
+                    speech_pad_ms           = 200,  # pad each speech window by 200ms
+                ),
             )
             lyrical = [
                 {"start": round(s.start, 2), "end": round(s.end, 2), "text": s.text.strip()}
