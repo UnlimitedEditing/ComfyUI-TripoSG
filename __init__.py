@@ -21,7 +21,18 @@ except Exception as _e:
     _RMAPS  = {}
     _RDMAPS = {}
 
-NODE_CLASS_MAPPINGS        = {**_MAPS,  **_RMAPS}
-NODE_DISPLAY_NAME_MAPPINGS = {**_DMAPS, **_RDMAPS}
+try:
+    from .nodes_concept import (
+        NODE_CLASS_MAPPINGS        as _CMAPS,
+        NODE_DISPLAY_NAME_MAPPINGS as _CDMAPS,
+    )
+    print(f"[ComfyUI-TripoSG] nodes_concept loaded — {len(_CMAPS)} lyric concept nodes registered")
+except Exception as _ce:
+    print(f"[ComfyUI-TripoSG] WARNING: nodes_concept failed to load: {_ce}")
+    _CMAPS  = {}
+    _CDMAPS = {}
+
+NODE_CLASS_MAPPINGS        = {**_MAPS, **_RMAPS, **_CMAPS}
+NODE_DISPLAY_NAME_MAPPINGS = {**_DMAPS, **_RDMAPS, **_CDMAPS}
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]

@@ -893,26 +893,60 @@ class TranscribeAudioFromURL:
             model = WhisperModel(model_size, device=device, compute_type=compute_type)
 
             lang   = language.strip() if language.strip() else None
-            segs, info = model.transcribe(tmp_path, language=lang, beam_size=5, word_timestamps=False)
-            segments = [{"start": round(s.start, 2), "end": round(s.end, 2), "text": s.text.strip()}
-                        for s in segs]
+            raw, info = model.transcribe(
+                tmp_path, language=lang, beam_size=5, word_timestamps=False,
+                no_speech_threshold=0.6,  # built-in: drops segments Whisper marks as non-vocal
+            )
+            lyrical = [
+                {"start": round(s.start, 2), "end": round(s.end, 2), "text": s.text.strip()}
+                for s in raw if s.text.strip()
+            ]
 
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
+        # ── Gap detection — build annotated timeline ───────────────────────────
+        # Any window > GAP_THRESH seconds between vocal segments becomes an
+        # instrumental entry. These are natural B-roll / scenic shot slots.
+        GAP_THRESH = 1.5
+        timeline   = []
+        prev_end   = 0.0
+
+        for seg in lyrical:
+            gap = round(seg["start"] - prev_end, 2)
+            if gap > GAP_THRESH:
+                timeline.append({
+                    "start": round(prev_end, 2),
+                    "end":   round(seg["start"], 2),
+                    "type":  "instrumental",
+                })
+            timeline.append({**seg, "type": "lyric"})
+            prev_end = seg["end"]
+
+        # Outro gap
+        if info.duration - prev_end > GAP_THRESH:
+            timeline.append({
+                "start": round(prev_end, 2),
+                "end":   round(info.duration, 2),
+                "type":  "instrumental",
+            })
+
+        n_lyric = sum(1 for e in timeline if e["type"] == "lyric")
+        n_instr = sum(1 for e in timeline if e["type"] == "instrumental")
+
         lyrics_data = {
             "language": info.language,
             "duration": round(info.duration, 2),
-            "segments": segments,
+            "timeline": timeline,
         }
         lyrics_json = json.dumps(lyrics_data, indent=2, ensure_ascii=False)
 
         # ── Render lyrics card ────────────────────────────────────────────────
-        CARD_W      = 1200
-        LINE_H      = 36
-        HEADER_H    = 70
-        PADDING     = 40
-        card_h      = max(600, HEADER_H + len(segments) * LINE_H + PADDING)
+        CARD_W   = 1200
+        LINE_H   = 36
+        HEADER_H = 70
+        PADDING  = 40
+        card_h   = max(600, HEADER_H + len(timeline) * LINE_H + PADDING)
 
         img  = Image.new("RGB", (CARD_W, card_h), color=(11, 14, 18))
         draw = ImageDraw.Draw(img)
@@ -922,22 +956,27 @@ class TranscribeAudioFromURL:
             font_text = ImageFont.load_default(size=19)
             font_hdr  = ImageFont.load_default(size=22)
         except TypeError:
-            # Older Pillow without size arg — use bitmap default
             font_ts = font_text = font_hdr = ImageFont.load_default()
 
-        # Header
-        meta = f"lang:{info.language}  dur:{info.duration:.1f}s  segs:{len(segments)}"
+        meta = (f"lang:{info.language}  dur:{info.duration:.1f}s  "
+                f"lyric:{n_lyric}  instrumental:{n_instr}")
         draw.text((PADDING, 16), "TIMED LYRICS", fill=(108, 71, 255), font=font_hdr)
         draw.text((PADDING + 280, 20), meta, fill=(80, 90, 110), font=font_ts)
         draw.line([(PADDING, 56), (CARD_W - PADDING, 56)], fill=(30, 33, 40), width=1)
 
-        # Segments
         y = HEADER_H
-        for seg in segments:
-            s, e = seg["start"], seg["end"]
+        for entry in timeline:
+            s, e = entry["start"], entry["end"]
             ts = f"[{int(s)//60:02d}:{s%60:05.2f}→{int(e)//60:02d}:{e%60:05.2f}]"
-            draw.text((PADDING, y), ts, fill=(108, 71, 255), font=font_ts)
-            draw.text((PADDING + 320, y), seg["text"], fill=(210, 215, 225), font=font_text)
+            if entry["type"] == "instrumental":
+                draw.rectangle([(PADDING - 4, y - 2), (CARD_W - PADDING, y + LINE_H - 6)],
+                                fill=(20, 22, 28))
+                draw.text((PADDING, y), ts, fill=(50, 60, 75), font=font_ts)
+                draw.text((PADDING + 320, y), f"── instrumental  ({e - s:.1f}s) ──",
+                          fill=(55, 70, 90), font=font_text)
+            else:
+                draw.text((PADDING, y), ts, fill=(108, 71, 255), font=font_ts)
+                draw.text((PADDING + 320, y), entry["text"], fill=(210, 215, 225), font=font_text)
             y += LINE_H
             if y > card_h - LINE_H:
                 draw.text((PADDING, y), "… (truncated)", fill=(60, 70, 90), font=font_ts)
