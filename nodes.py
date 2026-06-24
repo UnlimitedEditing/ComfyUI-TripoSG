@@ -907,7 +907,17 @@ class TranscribeAudioFromURL:
             # ── Transcribe ────────────────────────────────────────────────────
             device       = "cuda" if torch.cuda.is_available() else "cpu"
             compute_type = "float16" if device == "cuda" else "int8"
-            model = WhisperModel(model_size, device=device, compute_type=compute_type)
+
+            # If concept_mapping pre-downloaded the model weights, load from local path.
+            # Graydient puts concept_mapping files in {ComfyUI}/models/.
+            local_model_dir = os.path.join(
+                folder_paths.models_dir, "whisper", model_size
+            )
+            load_from = local_model_dir if os.path.isfile(
+                os.path.join(local_model_dir, "model.bin")
+            ) else model_size
+
+            model = WhisperModel(load_from, device=device, compute_type=compute_type)
 
             lang   = language.strip() if language.strip() else None
             raw, info = model.transcribe(
