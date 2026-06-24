@@ -878,6 +878,15 @@ class TranscribeAudioFromURL:
         # init_audio_url may pass a URL (direct) OR a local filename that
         # Graydient pre-downloaded (e.g. "init_audio__httpsapi.telegram.org...mp3").
         url_clean = url.strip()
+
+        if not url_clean:
+            # No URL supplied — return blank outputs so the workflow doesn't crash
+            blank = np.ones((512, 512, 3), dtype=np.float32)
+            card_t = torch.from_numpy(blank).unsqueeze(0)
+            import json as _json
+            empty = _json.dumps({"language": "unknown", "duration": 0.0, "timeline": []})
+            return (card_t, empty)
+
         tmp_dir   = tempfile.mkdtemp()
         ext       = os.path.splitext(url_clean.split("?")[0])[-1] or ".mp3"
         tmp_path  = os.path.join(tmp_dir, f"audio{ext}")
@@ -891,12 +900,14 @@ class TranscribeAudioFromURL:
                     for chunk in resp.iter_content(chunk_size=65536):
                         fh.write(chunk)
             else:
-                # Graydient pre-downloaded the file; resolve against ComfyUI input dir
+                # Graydient pre-downloaded the file; resolve against ComfyUI input dir.
+                # Use isfile() not exists() — avoids matching the input directory itself
+                # when url_clean is empty or resolves to a directory.
                 import folder_paths as _fp
                 candidate = os.path.join(_fp.get_input_directory(), url_clean)
-                if os.path.exists(candidate):
+                if os.path.isfile(candidate):
                     tmp_path = candidate
-                elif os.path.exists(url_clean):
+                elif os.path.isfile(url_clean):
                     tmp_path = url_clean
                 else:
                     raise FileNotFoundError(
@@ -1239,9 +1250,9 @@ class AudioAnalyze:
             else:
                 import folder_paths as _fp
                 candidate = os.path.join(_fp.get_input_directory(), url_clean)
-                if os.path.exists(candidate):
+                if os.path.isfile(candidate):
                     tmp_path = candidate
-                elif os.path.exists(url_clean):
+                elif os.path.isfile(url_clean):
                     tmp_path = url_clean
                 else:
                     raise FileNotFoundError(f"Audio file not found: {url_clean!r}")
