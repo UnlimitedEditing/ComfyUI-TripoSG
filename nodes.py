@@ -874,18 +874,35 @@ class TranscribeAudioFromURL:
                 "faster-whisper not installed. Add 'faster-whisper' to the workflow's pip requirements."
             )
 
-        # ── Download audio ────────────────────────────────────────────────────
-        tmp_dir  = tempfile.mkdtemp()
-        # Keep original extension so ffmpeg/whisper can sniff format
-        ext      = os.path.splitext(url.strip().split("?")[0])[-1] or ".mp3"
-        tmp_path = os.path.join(tmp_dir, f"audio{ext}")
+        # ── Resolve audio source ──────────────────────────────────────────────
+        # init_audio_url may pass a URL (direct) OR a local filename that
+        # Graydient pre-downloaded (e.g. "init_audio__httpsapi.telegram.org...mp3").
+        url_clean = url.strip()
+        tmp_dir   = tempfile.mkdtemp()
+        ext       = os.path.splitext(url_clean.split("?")[0])[-1] or ".mp3"
+        tmp_path  = os.path.join(tmp_dir, f"audio{ext}")
 
         try:
-            resp = requests.get(url.strip(), timeout=120, stream=True)
-            resp.raise_for_status()
-            with open(tmp_path, "wb") as fh:
-                for chunk in resp.iter_content(chunk_size=65536):
-                    fh.write(chunk)
+            if url_clean.startswith(("http://", "https://")):
+                # Direct URL — download ourselves
+                resp = requests.get(url_clean, timeout=120, stream=True)
+                resp.raise_for_status()
+                with open(tmp_path, "wb") as fh:
+                    for chunk in resp.iter_content(chunk_size=65536):
+                        fh.write(chunk)
+            else:
+                # Graydient pre-downloaded the file; resolve against ComfyUI input dir
+                import folder_paths as _fp
+                candidate = os.path.join(_fp.get_input_directory(), url_clean)
+                if os.path.exists(candidate):
+                    tmp_path = candidate
+                elif os.path.exists(url_clean):
+                    tmp_path = url_clean
+                else:
+                    raise FileNotFoundError(
+                        f"Audio file not found: {url_clean!r}\n"
+                        f"(looked in {_fp.get_input_directory()} and cwd)"
+                    )
 
             # ── Transcribe ────────────────────────────────────────────────────
             device       = "cuda" if torch.cuda.is_available() else "cpu"
@@ -1197,26 +1214,37 @@ class AudioAnalyze:
         except ImportError:
             raise RuntimeError("librosa / matplotlib not installed. Add them to pip requirements.")
 
-        # ── Download audio ────────────────────────────────────────────────────
-        tmp_dir  = tempfile.mkdtemp()
-        ext      = os.path.splitext(url.strip().split("?")[0])[-1] or ".mp3"
-        tmp_path = os.path.join(tmp_dir, f"audio{ext}")
+        # ── Resolve audio source (same logic as TranscribeAudioFromURL) ─────────
+        url_clean = url.strip()
+        tmp_dir   = tempfile.mkdtemp()
+        ext       = os.path.splitext(url_clean.split("?")[0])[-1] or ".mp3"
+        tmp_path  = os.path.join(tmp_dir, f"audio{ext}")
         try:
-            resp = requests.get(url.strip(), timeout=120, stream=True)
-            resp.raise_for_status()
-            with open(tmp_path, "wb") as fh:
-                for chunk in resp.iter_content(65536):
-                    fh.write(chunk)
+            if url_clean.startswith(("http://", "https://")):
+                resp = requests.get(url_clean, timeout=120, stream=True)
+                resp.raise_for_status()
+                with open(tmp_path, "wb") as fh:
+                    for chunk in resp.iter_content(65536):
+                        fh.write(chunk)
+            else:
+                import folder_paths as _fp
+                candidate = os.path.join(_fp.get_input_directory(), url_clean)
+                if os.path.exists(candidate):
+                    tmp_path = candidate
+                elif os.path.exists(url_clean):
+                    tmp_path = url_clean
+                else:
+                    raise FileNotFoundError(f"Audio file not found: {url_clean!r}")
 
             # ── Audio analysis ────────────────────────────────────────────────
-            y, sr   = librosa.load(tmp_path, sr=22050, mono=True)
+            y, sr    = librosa.load(tmp_path, sr=22050, mono=True)
             duration = float(librosa.get_duration(y=y, sr=sr))
-            hop     = 512
+            hop      = 512
 
-            # BPM + beats
+            # BPM + beats — np.asarray().item() handles both scalar and 0-d array
             tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr, hop_length=hop)
             beat_times = librosa.frames_to_time(beat_frames, sr=sr, hop_length=hop).tolist()
-            bpm = float(tempo)
+            bpm = float(np.asarray(tempo).item())
 
             # RMS energy (normalised 0-1)
             rms_raw = librosa.feature.rms(y=y, hop_length=hop)[0]
