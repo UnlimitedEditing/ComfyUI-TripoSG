@@ -100,6 +100,23 @@ You build impossible spaces, defy physical logic, and layer symbolic imagery ove
 Lyric sections stage the character in dreamlike non-Euclidean environments.
 Instrumental gaps are pure visual metaphor — objects transforming, gravity inverting, scale collapsing.
 {_JSON_SCHEMA}""",
+
+    "mv_energy_aware": f"""You are a music video director who works from BOTH lyrical content AND musical energy data.
+
+You will receive a JSON object with two keys:
+  "lyrics"  — timed transcript with lyric/instrumental sections
+  "energy"  — audio analysis: BPM, energy_timeline (0-1 normalised), beat_times, section_times
+
+Use the energy data to shape the FEEL and PACING of every scene:
+  energy > 0.7  →  dynamic, intense composition, tight framing, strong contrast, fast implied motion
+  energy 0.4-0.7 → balanced narrative, medium shot, natural lighting
+  energy < 0.4  → contemplative, wide establishing shot, soft or diffused light, slow implied motion
+
+For section_times boundaries, signal major visual transitions (location change, colour palette shift, new character framing).
+For beat_times, use implied rhythmic motion in the action field ("cuts on the beat", "pulse with the kick").
+
+Lyric sections are character-forward; instrumental sections are scenic B-roll whose visual intensity mirrors the energy curve.
+{_JSON_SCHEMA}""",
 }
 
 STYLE_KEYS = list(SYSTEM_PROMPTS.keys())
@@ -352,16 +369,52 @@ class LyricConceptGen:
         return (concept_json, card, encoded)
 
 
+class ScenePromptGen(LyricConceptGen):
+    """Energy-aware scene generation from combined lyrics + audio analysis.
+    Accepts lyrics_json AND energy_json separately and merges them before the LLM."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model":         ("LYRIC_LLM",),
+                "system_prompt": ("STRING", {"forceInput": True}),
+                "lyrics_json":   ("STRING", {"forceInput": True}),
+                "energy_json":   ("STRING", {"forceInput": True}),
+                "max_tokens":    ("INT", {"default": 2048, "min": 512, "max": 4096}),
+            }
+        }
+
+    RETURN_TYPES  = ("STRING", "IMAGE", "IMAGE")
+    RETURN_NAMES  = ("concept_json", "concept_card", "concept_data")
+    FUNCTION      = "generate_with_energy"
+    CATEGORY      = "LyricConcept"
+
+    def generate_with_energy(self, model, system_prompt, lyrics_json, energy_json, max_tokens):
+        import json
+        # Combine into a single structured context object for the LLM
+        try:
+            combined = json.dumps({"lyrics": json.loads(lyrics_json),
+                                   "energy": json.loads(energy_json)},
+                                  ensure_ascii=False)
+        except Exception:
+            combined = f'{{"lyrics": {lyrics_json}, "energy": {energy_json}}}'
+        # Reuse parent logic with combined context as the lyrics_json input
+        return self.generate(model, system_prompt, combined, max_tokens)
+
+
 # ── Registration ──────────────────────────────────────────────────────────────
 
 NODE_CLASS_MAPPINGS = {
     "LyricConceptLLMLoader":    LyricConceptLLMLoader,
     "LyricSystemPromptLibrary": LyricSystemPromptLibrary,
     "LyricConceptGen":          LyricConceptGen,
+    "ScenePromptGen":           ScenePromptGen,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LyricConceptLLMLoader":    "Lyric Concept LLM Loader",
     "LyricSystemPromptLibrary": "Lyric System Prompt Library",
     "LyricConceptGen":          "Lyric Concept Gen",
+    "ScenePromptGen":           "Scene Prompt Gen (Energy-Aware)",
 }

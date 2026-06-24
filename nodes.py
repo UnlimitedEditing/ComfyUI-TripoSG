@@ -1165,6 +1165,142 @@ class EncodeStringAsImage:
         return (_encode_string_as_image(text),)
 
 
+class AudioAnalyze:
+    """Download audio from URL, compute energy timeline / BPM / beats / section boundaries.
+    Returns analysis_json (STRING), annotated spectrogram (IMAGE), encoded data (IMAGE).
+    Dependencies: librosa, matplotlib (both pip-installable on Graydient)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"url": ("STRING", {"default": ""})}}
+
+    RETURN_TYPES  = ("STRING", "IMAGE", "IMAGE")
+    RETURN_NAMES  = ("analysis_json", "spectrogram", "analysis_data")
+    FUNCTION      = "analyze"
+    CATEGORY      = "TripoSG"
+
+    def analyze(self, url: str):
+        import json
+        import os
+        import shutil
+        import tempfile
+
+        import requests
+        import torch
+
+        try:
+            import librosa
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.gridspec as gridspec
+            import matplotlib.pyplot as plt
+        except ImportError:
+            raise RuntimeError("librosa / matplotlib not installed. Add them to pip requirements.")
+
+        # ── Download audio ────────────────────────────────────────────────────
+        tmp_dir  = tempfile.mkdtemp()
+        ext      = os.path.splitext(url.strip().split("?")[0])[-1] or ".mp3"
+        tmp_path = os.path.join(tmp_dir, f"audio{ext}")
+        try:
+            resp = requests.get(url.strip(), timeout=120, stream=True)
+            resp.raise_for_status()
+            with open(tmp_path, "wb") as fh:
+                for chunk in resp.iter_content(65536):
+                    fh.write(chunk)
+
+            # ── Audio analysis ────────────────────────────────────────────────
+            y, sr   = librosa.load(tmp_path, sr=22050, mono=True)
+            duration = float(librosa.get_duration(y=y, sr=sr))
+            hop     = 512
+
+            # BPM + beats
+            tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr, hop_length=hop)
+            beat_times = librosa.frames_to_time(beat_frames, sr=sr, hop_length=hop).tolist()
+            bpm = float(tempo)
+
+            # RMS energy (normalised 0-1)
+            rms_raw = librosa.feature.rms(y=y, hop_length=hop)[0]
+            rms_max = float(rms_raw.max()) or 1.0
+            frame_times = librosa.frames_to_time(
+                np.arange(len(rms_raw)), sr=sr, hop_length=hop
+            )
+
+            energy_timeline = [
+                {"time": round(float(t), 2), "energy": round(float(e) / rms_max, 3)}
+                for t, e in zip(frame_times, rms_raw)
+                if float(t) <= duration
+            ]
+
+            # Section segmentation (MFCC recurrence matrix)
+            mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13, hop_length=hop)
+            R    = librosa.segment.recurrence_matrix(mfcc, mode="affinity", sym=True)
+            seg_frames = librosa.segment.agglomerative(R, k=min(8, R.shape[0] - 1))
+            section_times = sorted(set(
+                round(float(t), 2)
+                for t in librosa.frames_to_time(seg_frames, sr=sr, hop_length=hop)
+                if 0 < float(t) < duration
+            ))
+
+            analysis = {
+                "duration":         round(duration, 2),
+                "bpm":              round(bpm, 1),
+                "energy_timeline":  energy_timeline,
+                "beat_times":       [round(t, 3) for t in beat_times],
+                "section_times":    section_times,
+            }
+            analysis_json = json.dumps(analysis, ensure_ascii=False)
+
+            # ── Annotated spectrogram ─────────────────────────────────────────
+            fig = plt.figure(figsize=(16, 8), facecolor="#0b0e12")
+            gs  = gridspec.GridSpec(2, 1, height_ratios=[3, 1], hspace=0.12)
+
+            ax1 = fig.add_subplot(gs[0])
+            S   = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=128, hop_length=hop)
+            librosa.display.specshow(
+                librosa.power_to_db(S, ref=np.max),
+                sr=sr, hop_length=hop, x_axis="time", y_axis="mel",
+                ax=ax1, cmap="magma",
+            )
+            ax1.set_facecolor("#0b0e12")
+            ax1.tick_params(colors="#4a5168")
+            ax1.set_ylabel("Hz", color="#4a5168", fontsize=8)
+            ax1.set_xlabel("")
+            for bt in beat_times:
+                ax1.axvline(bt, color="#6c47ff", alpha=0.25, linewidth=0.5)
+            for st in section_times:
+                ax1.axvline(st, color="#5bc8e0", alpha=0.8, linewidth=1.5, linestyle="--")
+            ax1.set_title(f"BPM {bpm:.1f}  ·  dur {duration:.1f}s  ·  {len(section_times)} sections",
+                          color="#9099a8", fontsize=9, pad=4)
+
+            ax2 = fig.add_subplot(gs[1])
+            ax2.set_facecolor("#0b0e12")
+            rms_norm = rms_raw / rms_max
+            ax2.fill_between(frame_times[:len(rms_norm)], rms_norm,
+                             color="#6c47ff", alpha=0.5)
+            ax2.plot(frame_times[:len(rms_norm)], rms_norm,
+                     color="#6c47ff", linewidth=0.8)
+            for st in section_times:
+                ax2.axvline(st, color="#5bc8e0", alpha=0.8, linewidth=1.5, linestyle="--")
+            ax2.set_ylabel("Energy", color="#4a5168", fontsize=8)
+            ax2.set_xlabel("Time (s)", color="#4a5168", fontsize=8)
+            ax2.tick_params(colors="#4a5168")
+            ax2.set_xlim(0, duration)
+            ax2.set_ylim(0, 1.05)
+
+            plt.tight_layout(pad=0.4)
+            fig.canvas.draw()
+            w, h  = fig.canvas.get_width_height()
+            buf   = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(h, w, 3)
+            plt.close(fig)
+
+            spec_t   = torch.from_numpy(buf.astype(np.float32) / 255.0).unsqueeze(0)
+            encoded  = _encode_string_as_image(analysis_json)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        return (analysis_json, spec_t, encoded)
+
+
 # Node registration — URL loaders always available; 3D nodes require full pip deps
 NODE_CLASS_MAPPINGS = {
     "LoadImageFromURL":       LoadImageFromURL,
@@ -1173,6 +1309,7 @@ NODE_CLASS_MAPPINGS = {
     "HFTextGenerate":         HFTextGenerate,
     "VLMInferFromURL":        VLMInferFromURL,
     "EncodeStringAsImage":    EncodeStringAsImage,
+    "AudioAnalyze":           AudioAnalyze,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LoadImageFromURL":       "Load Image From URL",
@@ -1181,6 +1318,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "HFTextGenerate":         "HF Text Generate",
     "VLMInferFromURL":        "VLM Infer From URL",
     "EncodeStringAsImage":    "Encode String As Image",
+    "AudioAnalyze":           "Audio Analyze",
 }
 
 if _TRIPOSG_AVAILABLE:
