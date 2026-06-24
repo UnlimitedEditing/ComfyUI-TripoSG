@@ -101,11 +101,14 @@ Lyric sections stage the character in dreamlike non-Euclidean environments.
 Instrumental gaps are pure visual metaphor — objects transforming, gravity inverting, scale collapsing.
 {_JSON_SCHEMA}""",
 
-    "mv_energy_aware": f"""You are a music video director who works from BOTH lyrical content AND musical energy data.
+    "mv_energy_aware": f"""You are a music video director who works from lyrical content, musical energy data, and optional creative direction.
 
-You will receive a JSON object with two keys:
+You will receive a JSON object with these keys:
+  "context" (optional) — a free-form creative brief from the director. If present, treat this as your PRIMARY creative guide. It overrides any assumptions you might draw from the lyrics alone.
   "lyrics"  — timed transcript with lyric/instrumental sections
   "energy"  — audio analysis: BPM, energy_timeline (0-1 normalised), beat_times, section_times
+
+If "context" is present, anchor the theme, palette, characters, and tone to it first, then fit the lyrics and energy around that vision.
 
 Use the energy data to shape the FEEL and PACING of every scene:
   energy > 0.7  →  dynamic, intense composition, tight framing, strong contrast, fast implied motion
