@@ -1350,6 +1350,57 @@ class AudioAnalyze:
         return (analysis_json, spec_t, encoded)
 
 
+class LoadAudioFromURLStereo:
+    """Download audio from URL and decode as full-fidelity stereo AUDIO.
+
+    Unlike ComfyUI-MisoTTS's LoadAudioFromURL (hardcoded mono/24kHz, tuned for
+    voice cloning), this preserves stereo channels and a configurable sample
+    rate — required for Matchering, which needs the target's real stereo image
+    and headroom, not a downsampled mono copy."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "url": ("STRING", {"default": ""}),
+                "sample_rate": ("INT", {"default": 44100, "min": 8000, "max": 192000, "step": 1}),
+            }
+        }
+
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("audio",)
+    FUNCTION = "load"
+    CATEGORY = "TripoSG"
+
+    def load(self, url, sample_rate):
+        import subprocess
+        import tempfile
+        import urllib.request
+
+        import numpy as np
+        import torch
+
+        with urllib.request.urlopen(url) as resp:
+            data = resp.read()
+
+        with tempfile.NamedTemporaryFile(suffix=os.path.splitext(url.split("?")[0])[1] or ".bin") as tmp:
+            tmp.write(data)
+            tmp.flush()
+            cmd = [
+                "ffmpeg", "-v", "error", "-i", tmp.name,
+                "-f", "s16le", "-acodec", "pcm_s16le",
+                "-ar", str(sample_rate), "-ac", "2", "-",
+            ]
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if proc.returncode != 0:
+                raise RuntimeError(f"ffmpeg failed to decode audio from {url}: {proc.stderr.decode(errors='replace')}")
+
+        arr = np.frombuffer(proc.stdout, dtype="<i2").astype("float32") / 32768.0
+        arr = arr.reshape(-1, 2).T  # [channels=2, samples]
+        waveform = torch.from_numpy(arr.copy())
+        return ({"waveform": waveform.unsqueeze(0), "sample_rate": sample_rate},)
+
+
 # Node registration — URL loaders always available; 3D nodes require full pip deps
 NODE_CLASS_MAPPINGS = {
     "LoadImageFromURL":       LoadImageFromURL,
@@ -1359,6 +1410,7 @@ NODE_CLASS_MAPPINGS = {
     "VLMInferFromURL":        VLMInferFromURL,
     "EncodeStringAsImage":    EncodeStringAsImage,
     "AudioAnalyze":           AudioAnalyze,
+    "LoadAudioFromURLStereo": LoadAudioFromURLStereo,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LoadImageFromURL":       "Load Image From URL",
@@ -1368,6 +1420,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VLMInferFromURL":        "VLM Infer From URL",
     "EncodeStringAsImage":    "Encode String As Image",
     "AudioAnalyze":           "Audio Analyze",
+    "LoadAudioFromURLStereo": "Load Audio From URL (Stereo)",
 }
 
 if _TRIPOSG_AVAILABLE:
