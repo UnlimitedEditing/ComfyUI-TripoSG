@@ -719,7 +719,7 @@ class LoadImageFromURL:
         return (image, mask)
 
 
-class LoadVideoFromURL:
+class TripoSGLoadVideoFromURL:
     """Download a video from URL and decode frames as an IMAGE batch."""
 
     @classmethod
@@ -1404,7 +1404,7 @@ class LoadAudioFromURLStereo:
 # Node registration — URL loaders always available; 3D nodes require full pip deps
 NODE_CLASS_MAPPINGS = {
     "LoadImageFromURL":       LoadImageFromURL,
-    "LoadVideoFromURL":       LoadVideoFromURL,
+    "TripoSGLoadVideoFromURL": TripoSGLoadVideoFromURL,
     "TranscribeAudioFromURL": TranscribeAudioFromURL,
     "HFTextGenerate":         HFTextGenerate,
     "VLMInferFromURL":        VLMInferFromURL,
@@ -1414,7 +1414,7 @@ NODE_CLASS_MAPPINGS = {
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LoadImageFromURL":       "Load Image From URL",
-    "LoadVideoFromURL":       "Load Video From URL",
+    "TripoSGLoadVideoFromURL": "TripoSG Load Video From URL",
     "TranscribeAudioFromURL": "Transcribe Audio From URL",
     "HFTextGenerate":         "HF Text Generate",
     "VLMInferFromURL":        "VLM Infer From URL",
