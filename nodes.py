@@ -745,9 +745,18 @@ class TripoSGLoadVideoFromURL:
         import subprocess
         import tempfile
 
-        if not url.strip():
+        url = url.strip()
+        if not url:
             blank = np.zeros((max_frames, height, width, 3), dtype=np.float32)
             return (torch.from_numpy(blank),)
+
+        # Graydient's video-upload field mapping (as opposed to a fetchable
+        # init_image_url) drops the file into ComfyUI's local input/ directory
+        # and passes back a bare filename, not a URL — same convention as the
+        # native LoadVideo widget. requests.get() on a bare filename raises
+        # MissingSchema, so treat anything without an http(s) scheme as a local
+        # upload and resolve it through folder_paths instead of fetching it.
+        is_remote = url.startswith("http://") or url.startswith("https://")
 
         tmp_dir    = tempfile.mkdtemp()
         tmp_video  = os.path.join(tmp_dir, "input.mp4")
@@ -755,11 +764,17 @@ class TripoSGLoadVideoFromURL:
         os.makedirs(frames_dir)
 
         try:
-            resp = requests.get(url.strip(), timeout=120, stream=True)
-            resp.raise_for_status()
-            with open(tmp_video, "wb") as fh:
-                for chunk in resp.iter_content(chunk_size=65536):
-                    fh.write(chunk)
+            if is_remote:
+                resp = requests.get(url, timeout=120, stream=True)
+                resp.raise_for_status()
+                with open(tmp_video, "wb") as fh:
+                    for chunk in resp.iter_content(chunk_size=65536):
+                        fh.write(chunk)
+            else:
+                local_path = folder_paths.get_annotated_filepath(url)
+                if not os.path.isfile(local_path):
+                    raise RuntimeError(f"local video upload not found: {url}")
+                shutil.copyfile(local_path, tmp_video)
 
             subprocess.check_call([
                 "ffmpeg", "-y", "-i", tmp_video,
