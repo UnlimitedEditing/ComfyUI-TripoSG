@@ -697,7 +697,8 @@ class LoadImageFromURL:
     def load(self, url):
         import requests
 
-        if not url.strip():
+        url = url.strip()
+        if not url:
             # No URL supplied — return a blank white 512×512 image so
             # text-only runs (e.g. TripoSG-scribble with prompt only) don't crash.
             blank = np.ones((512, 512, 3), dtype=np.float32)
@@ -705,10 +706,25 @@ class LoadImageFromURL:
             mask  = torch.zeros((1, 512, 512), dtype=torch.float32)
             return (image, mask)
 
-        response = requests.get(url.strip(), timeout=30)
-        response.raise_for_status()
+        # Graydient's image-upload field mapping (as opposed to a fetchable
+        # init_image_url) sometimes drops the file into ComfyUI's local input/
+        # directory and passes back a bare filename, not a URL — architecturally
+        # unpredictable per submission path, confirmed on the same local_field
+        # across different jobs (see KI-007 §2/§7). requests.get() on a bare
+        # filename raises MissingSchema, so treat anything without an http(s)
+        # scheme as a local upload and resolve it through folder_paths instead
+        # of fetching it — same pattern as TripoSGLoadVideoFromURL below.
+        is_remote = url.startswith("http://") or url.startswith("https://")
 
-        img = Image.open(BytesIO(response.content)).convert("RGBA")
+        if is_remote:
+            response = requests.get(url, timeout=30)
+            response.raise_for_status()
+            img = Image.open(BytesIO(response.content)).convert("RGBA")
+        else:
+            local_path = folder_paths.get_annotated_filepath(url)
+            if not os.path.isfile(local_path):
+                raise RuntimeError(f"local image upload not found: {url}")
+            img = Image.open(local_path).convert("RGBA")
         arr = np.array(img).astype(np.float32) / 255.0
 
         # IMAGE: [1, H, W, 3] RGB float32 0–1
