@@ -1078,6 +1078,304 @@ class TranscribeAudioFromURL:
         return (img_t, lyrics_json)
 
 
+class LoadVideoFromURLAuto:
+    """Download a video from URL and decode frames as an IMAGE batch, auto-detecting
+    the source resolution via ffprobe (aspect-ratio preserving, capped to max_side)
+    instead of forcing a fixed width/height like TripoSGLoadVideoFromURL. Used by the
+    subtitle-burn pipeline so on-screen text can be sized/positioned relative to the
+    video's real frame dimensions rather than a hardcoded default."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "url":        ("STRING", {"default": ""}),
+                "max_frames": ("INT",   {"default": 720, "min": 1, "max": 3000}),
+                "fps":        ("FLOAT", {"default": 24.0, "min": 1.0, "max": 60.0}),
+                "max_side":   ("INT",   {"default": 1280, "min": 64, "max": 4096, "step": 8}),
+            }
+        }
+
+    RETURN_TYPES  = ("IMAGE",)
+    RETURN_NAMES  = ("frames",)
+    FUNCTION      = "load"
+    CATEGORY      = "TripoSG"
+
+    def load(self, url, max_frames=720, fps=24.0, max_side=1280):
+        import json as _json
+        import shutil
+        import subprocess
+        import tempfile
+
+        import requests
+
+        url = url.strip()
+        if not url:
+            blank = np.zeros((1, 480, 832, 3), dtype=np.float32)
+            return (torch.from_numpy(blank),)
+
+        is_remote = url.startswith("http://") or url.startswith("https://")
+        tmp_dir    = tempfile.mkdtemp()
+        tmp_video  = os.path.join(tmp_dir, "input.mp4")
+        frames_dir = os.path.join(tmp_dir, "frames")
+        os.makedirs(frames_dir)
+
+        try:
+            if is_remote:
+                resp = requests.get(url, timeout=120, stream=True)
+                resp.raise_for_status()
+                with open(tmp_video, "wb") as fh:
+                    for chunk in resp.iter_content(chunk_size=65536):
+                        fh.write(chunk)
+            else:
+                # Graydient's video-upload field mapping drops the file into ComfyUI's
+                # local input/ directory and passes back a bare filename, not a URL.
+                local_path = folder_paths.get_annotated_filepath(url)
+                if not os.path.isfile(local_path):
+                    raise RuntimeError(f"local video upload not found: {url}")
+                shutil.copyfile(local_path, tmp_video)
+
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=width,height",
+                 "-of", "json", tmp_video],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            )
+            try:
+                info = _json.loads(probe.stdout or b"{}")
+                streams = info.get("streams", [{}])
+                src_w = int(streams[0].get("width", 1280))
+                src_h = int(streams[0].get("height", 720))
+            except Exception:
+                src_w, src_h = 1280, 720
+
+            scale = min(1.0, max_side / max(src_w, src_h))
+            # h264 requires even dimensions
+            out_w = max(2, int(round(src_w * scale / 2)) * 2)
+            out_h = max(2, int(round(src_h * scale / 2)) * 2)
+
+            subprocess.check_call([
+                "ffmpeg", "-y", "-i", tmp_video,
+                "-vf", f"fps={fps},scale={out_w}:{out_h}:flags=lanczos",
+                "-frames:v", str(max_frames),
+                "-pix_fmt", "rgb24", "-f", "image2",
+                os.path.join(frames_dir, "frame_%05d.png"),
+            ], stderr=subprocess.DEVNULL)
+
+            frame_paths = sorted(Path(frames_dir).glob("frame_*.png"))
+            if not frame_paths:
+                raise RuntimeError("ffmpeg produced no frames from the video")
+
+            frames = [np.array(Image.open(p).convert("RGB")) for p in frame_paths[:max_frames]]
+            return (torch.from_numpy(np.stack(frames).astype(np.float32) / 255.0),)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+_FONT_CACHE = {}
+
+
+def _resolve_font_path(family: str):
+    """Map a font family name to a bundled TTF path + horizontal squeeze factor
+    (used to fake a 'condensed' variant without shipping a separate font file).
+    Sourced from matplotlib's bundled DejaVu fonts, which ship as package data
+    with a very common pip dependency rather than relying on system fonts being
+    present in an ephemeral container."""
+    if family in _FONT_CACHE:
+        return _FONT_CACHE[family]
+
+    mpl_ttf_dir = None
+    try:
+        import matplotlib
+        mpl_ttf_dir = os.path.join(matplotlib.get_data_path(), "fonts", "ttf")
+    except Exception:
+        pass
+
+    fname_map = {
+        "sans":      "DejaVuSans-Bold.ttf",
+        "serif":     "DejaVuSerif-Bold.ttf",
+        "mono":      "DejaVuSansMono-Bold.ttf",
+        "condensed": "DejaVuSans-Bold.ttf",   # squeezed horizontally, see below
+    }
+    squeeze = 0.78 if family == "condensed" else 1.0
+    fname   = fname_map.get(family, fname_map["sans"])
+
+    search_dirs = [mpl_ttf_dir] if mpl_ttf_dir else []
+    search_dirs += ["/usr/share/fonts/truetype/dejavu", "/usr/share/fonts/truetype/liberation"]
+
+    for d in search_dirs:
+        if not d:
+            continue
+        p = os.path.join(d, fname)
+        if os.path.isfile(p):
+            _FONT_CACHE[family] = (p, squeeze)
+            return _FONT_CACHE[family]
+
+    _FONT_CACHE[family] = (None, squeeze)
+    return _FONT_CACHE[family]
+
+
+def _hex_to_rgb(s: str, default=(255, 255, 255)):
+    s = (s or "").strip().lstrip("#")
+    if len(s) == 3:
+        s = "".join(c * 2 for c in s)
+    if len(s) != 6:
+        return default
+    try:
+        return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return default
+
+
+def _wrap_lines(text, font, max_width, draw):
+    words = text.split()
+    lines, cur = [], ""
+    for word in words:
+        trial = (cur + " " + word).strip()
+        bbox = draw.textbbox((0, 0), trial, font=font)
+        if bbox[2] - bbox[0] <= max_width or not cur:
+            cur = trial
+        else:
+            lines.append(cur)
+            cur = word
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def _render_subtitle_layer(lines, font, color, style, outline_w, squeeze, max_w):
+    """Render wrapped subtitle lines onto a transparent RGBA layer, applying the
+    chosen style (outline / box / shadow). squeeze < 1.0 fakes a condensed font by
+    horizontally compressing the finished layer instead of shipping a separate font."""
+    from PIL import Image, ImageDraw
+
+    pad = outline_w + 4
+    probe = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+    line_boxes = [probe.textbbox((0, 0), ln, font=font) for ln in lines]
+    line_w = [b[2] - b[0] for b in line_boxes]
+    ascent, descent = font.getmetrics()
+    line_step = ascent + descent + max(2, int(font.size * 0.15))
+
+    layer_w = min(max_w, max(line_w) + pad * 2) if line_w else pad * 2
+    layer_h = line_step * len(lines) + pad * 2
+    layer = Image.new("RGBA", (max(1, layer_w), max(1, layer_h)), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(layer)
+
+    y = pad
+    for ln, lw in zip(lines, line_w):
+        x = (layer_w - lw) // 2
+        if style == "box":
+            draw.rectangle(
+                [(pad // 2, y - pad // 3), (layer_w - pad // 2, y + line_step - pad // 3)],
+                fill=(0, 0, 0, 150),
+            )
+            draw.text((x, y), ln, font=font, fill=(*color, 255))
+        elif style == "shadow":
+            dx = dy = max(1, outline_w)
+            draw.text((x + dx, y + dy), ln, font=font, fill=(0, 0, 0, 200))
+            draw.text((x, y), ln, font=font, fill=(*color, 255))
+        else:  # "outline" — thin black stroke, universal readability, the default
+            draw.text((x, y), ln, font=font, fill=(*color, 255),
+                       stroke_width=outline_w, stroke_fill=(0, 0, 0, 255))
+        y += line_step
+
+    if squeeze < 0.999:
+        layer = layer.resize((max(1, int(layer_w * squeeze)), layer_h), Image.LANCZOS)
+
+    return layer
+
+
+class BurnSubtitlesFromTimeline:
+    """Burn dynamically positioned/sized subtitles onto a video frame batch using a
+    Whisper timeline (as produced by TranscribeAudioFromURL's lyrics_json output).
+    Font size and bottom margin scale with the actual frame resolution rather than a
+    fixed pixel value, so the same workflow looks right at any aspect ratio. Styling
+    (font family / size / colour / outline-vs-box-vs-shadow) is exposed as plain
+    widgets so Graydient can wire them to slot1-slot4."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "frames":      ("IMAGE",),
+                "lyrics_json": ("STRING", {"default": "", "multiline": True}),
+                "fps":         ("FLOAT", {"default": 24.0, "min": 1.0, "max": 60.0}),
+                "font_family": (["sans", "serif", "mono", "condensed"], {"default": "sans"}),
+                "font_scale":  ("FLOAT", {"default": 1.0, "min": 0.4, "max": 2.5, "step": 0.05}),
+                "text_color":  ("STRING", {"default": "#FFFFFF"}),
+                "style":       (["outline", "box", "shadow"], {"default": "outline"}),
+            }
+        }
+
+    RETURN_TYPES  = ("IMAGE",)
+    RETURN_NAMES  = ("frames",)
+    FUNCTION      = "burn"
+    CATEGORY      = "TripoSG"
+
+    def burn(self, frames, lyrics_json, fps=24.0, font_family="sans", font_scale=1.0,
+             text_color="#FFFFFF", style="outline"):
+        import json
+
+        from PIL import Image, ImageDraw, ImageFont
+
+        n, h, w, _ = frames.shape
+
+        try:
+            data = json.loads(lyrics_json) if lyrics_json and lyrics_json.strip() else {"timeline": []}
+        except Exception:
+            data = {"timeline": []}
+        entries = [e for e in data.get("timeline", [])
+                   if e.get("type") == "lyric" and e.get("text")]
+        entries.sort(key=lambda e: e["start"])
+
+        if not entries:
+            return (frames,)
+
+        font_path, squeeze = _resolve_font_path(font_family)
+        base_size = max(10, int(round(h * 0.052 * font_scale)))
+        font = (ImageFont.truetype(font_path, base_size)
+                if font_path else ImageFont.load_default(size=base_size))
+
+        color = _hex_to_rgb(text_color)
+        margin_bottom  = max(4, int(round(h * 0.06)))
+        max_text_width = max(20, int(round(w * 0.88 / squeeze)))
+        outline_w      = max(1, int(round(base_size * 0.07)))
+
+        frames_np = (frames.cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+        out = np.empty_like(frames_np)
+
+        probe_draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+
+        cur_entry, cur_layer = None, None
+        e_i, n_entries = 0, len(entries)
+
+        for i in range(n):
+            t = i / fps
+            while e_i < n_entries and entries[e_i]["end"] <= t:
+                e_i += 1
+            entry = entries[e_i] if e_i < n_entries and entries[e_i]["start"] <= t < entries[e_i]["end"] else None
+
+            frame_img = Image.fromarray(frames_np[i]).convert("RGBA")
+
+            if entry is not None:
+                if entry is not cur_entry:
+                    cur_entry = entry
+                    lines = _wrap_lines(entry["text"], font, max_text_width, probe_draw)
+                    cur_layer = _render_subtitle_layer(
+                        lines, font, color, style, outline_w, squeeze, w
+                    )
+                if cur_layer is not None:
+                    lw, lh = cur_layer.size
+                    px = (w - lw) // 2
+                    py = h - margin_bottom - lh
+                    frame_img.alpha_composite(cur_layer, (px, max(0, py)))
+
+            out[i] = np.array(frame_img.convert("RGB"))
+
+        result = torch.from_numpy(out.astype(np.float32) / 255.0)
+        return (result,)
+
+
 class HFTextGenerate:
     """Run text-only inference with any HuggingFace instruction-tuned model.
     Returns the response as a STRING and as an encoded data IMAGE (for Graydient output).
@@ -1436,7 +1734,9 @@ class LoadAudioFromURLStereo:
 NODE_CLASS_MAPPINGS = {
     "LoadImageFromURL":       LoadImageFromURL,
     "TripoSGLoadVideoFromURL": TripoSGLoadVideoFromURL,
+    "LoadVideoFromURLAuto":   LoadVideoFromURLAuto,
     "TranscribeAudioFromURL": TranscribeAudioFromURL,
+    "BurnSubtitlesFromTimeline": BurnSubtitlesFromTimeline,
     "HFTextGenerate":         HFTextGenerate,
     "VLMInferFromURL":        VLMInferFromURL,
     "EncodeStringAsImage":    EncodeStringAsImage,
@@ -1446,7 +1746,9 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LoadImageFromURL":       "Load Image From URL",
     "TripoSGLoadVideoFromURL": "TripoSG Load Video From URL",
+    "LoadVideoFromURLAuto":   "Load Video From URL (Auto Res)",
     "TranscribeAudioFromURL": "Transcribe Audio From URL",
+    "BurnSubtitlesFromTimeline": "Burn Subtitles From Timeline",
     "HFTextGenerate":         "HF Text Generate",
     "VLMInferFromURL":        "VLM Infer From URL",
     "EncodeStringAsImage":    "Encode String As Image",
