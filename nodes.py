@@ -983,13 +983,17 @@ class TranscribeAudioFromURL:
                 if s.words:
                     seg_start = s.words[0].start
                     seg_end   = s.words[-1].end
+                    words = [{"start": round(w.start, 2), "end": round(w.end, 2),
+                              "text": w.word.strip()} for w in s.words if w.word.strip()]
                 else:
                     seg_start = s.start
                     seg_end   = s.end
+                    words = []
                 lyrical.append({
                     "start": round(seg_start, 2),
                     "end":   round(seg_end,   2),
                     "text":  text,
+                    "words": words,
                 })
 
         finally:
@@ -1285,13 +1289,42 @@ def _render_subtitle_layer(lines, font, color, style, outline_w, squeeze, max_w)
     return layer
 
 
+def _rechunk_by_speed(entries, speed):
+    """Regroup each lyric entry's words into shorter caption chunks as speed rises.
+    speed<=1 is a no-op (natural Whisper sentence segments = 'normal pacing'); higher
+    speed caps each chunk to fewer words, so captions cut faster and show less text
+    at once. Entries with no word-level timing (older lyrics_json, or a segment
+    faster-whisper didn't return words for) pass through unchanged."""
+    if speed <= 1.01:
+        return entries
+
+    max_words = max(1, round(9.0 / speed))
+    out = []
+    for e in entries:
+        words = e.get("words") or []
+        if len(words) <= max_words:
+            out.append(e)
+            continue
+        for i in range(0, len(words), max_words):
+            chunk = words[i:i + max_words]
+            out.append({
+                "start": chunk[0]["start"],
+                "end":   chunk[-1]["end"],
+                "text":  " ".join(w["text"] for w in chunk).strip(),
+                "type":  "lyric",
+            })
+    return out
+
+
 class BurnSubtitlesFromTimeline:
     """Burn dynamically positioned/sized subtitles onto a video frame batch using a
     Whisper timeline (as produced by TranscribeAudioFromURL's lyrics_json output).
     Font size and bottom margin scale with the actual frame resolution rather than a
     fixed pixel value, so the same workflow looks right at any aspect ratio. Styling
     (font family / size / colour / outline-vs-box-vs-shadow) is exposed as plain
-    widgets so Graydient can wire them to slot1-slot4."""
+    widgets so Graydient can wire them to slot1-slot4. `speed` (slot5) controls how
+    aggressively long Whisper segments get split into shorter word-chunks — 1 keeps
+    natural sentence-length captions, 4 cuts to ~2 words per caption."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -1304,6 +1337,7 @@ class BurnSubtitlesFromTimeline:
                 "font_scale":  ("FLOAT", {"default": 1.0, "min": 0.4, "max": 2.5, "step": 0.05}),
                 "text_color":  ("STRING", {"default": "#FFFFFF"}),
                 "style":       (["outline", "box", "shadow"], {"default": "outline"}),
+                "speed":       ("FLOAT", {"default": 1.0, "min": 1.0, "max": 4.0, "step": 0.1}),
             }
         }
 
@@ -1313,7 +1347,7 @@ class BurnSubtitlesFromTimeline:
     CATEGORY      = "TripoSG"
 
     def burn(self, frames, lyrics_json, fps=24.0, font_family="sans", font_scale=1.0,
-             text_color="#FFFFFF", style="outline"):
+             text_color="#FFFFFF", style="outline", speed=1.0):
         import json
 
         from PIL import Image, ImageDraw, ImageFont
@@ -1326,6 +1360,7 @@ class BurnSubtitlesFromTimeline:
             data = {"timeline": []}
         entries = [e for e in data.get("timeline", [])
                    if e.get("type") == "lyric" and e.get("text")]
+        entries = _rechunk_by_speed(entries, speed)
         entries.sort(key=lambda e: e["start"])
 
         if not entries:
