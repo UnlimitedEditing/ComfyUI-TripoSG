@@ -880,6 +880,12 @@ class TranscribeAudioFromURL:
                 "url":        ("STRING", {"default": ""}),
                 "model_size": (["large-v3", "medium", "small", "base"], {}),
                 "language":   ("STRING", {"default": ""}),
+            },
+            "optional": {
+                # Graydient's init_<type>_* is a {bool, filename, url} triplet and
+                # it's unconfirmed which of filename/url gets populated for a given
+                # submission path -- accept both, first non-empty wins.
+                "filename": ("STRING", {"default": ""}),
             }
         }
 
@@ -888,7 +894,7 @@ class TranscribeAudioFromURL:
     FUNCTION      = "transcribe"
     CATEGORY      = "TripoSG"
 
-    def transcribe(self, url, model_size="large-v3", language=""):
+    def transcribe(self, url, model_size="large-v3", language="", filename=""):
         import json
         import os
         import shutil
@@ -908,7 +914,7 @@ class TranscribeAudioFromURL:
         # ── Resolve audio source ──────────────────────────────────────────────
         # init_audio_url may pass a URL (direct) OR a local filename that
         # Graydient pre-downloaded (e.g. "init_audio__httpsapi.telegram.org...mp3").
-        url_clean = url.strip()
+        url_clean = (url or "").strip() or (filename or "").strip()
 
         if not url_clean:
             # No URL supplied — return blank outputs so the workflow doesn't crash
@@ -1097,6 +1103,12 @@ class LoadVideoFromURLAuto:
                 "max_frames": ("INT",   {"default": 720, "min": 1, "max": 3000}),
                 "fps":        ("FLOAT", {"default": 24.0, "min": 1.0, "max": 60.0}),
                 "max_side":   ("INT",   {"default": 1280, "min": 64, "max": 4096, "step": 8}),
+            },
+            "optional": {
+                # Graydient's init_video_* is a {bool, filename, url} triplet and it's
+                # unconfirmed which of filename/url gets populated for a given
+                # submission path -- accept both, first non-empty wins.
+                "filename": ("STRING", {"default": ""}),
             }
         }
 
@@ -1105,7 +1117,7 @@ class LoadVideoFromURLAuto:
     FUNCTION      = "load"
     CATEGORY      = "TripoSG"
 
-    def load(self, url, max_frames=720, fps=24.0, max_side=1280):
+    def load(self, url, max_frames=720, fps=24.0, max_side=1280, filename=""):
         import json as _json
         import shutil
         import subprocess
@@ -1113,7 +1125,7 @@ class LoadVideoFromURLAuto:
 
         import requests
 
-        url = url.strip()
+        url = (url or "").strip() or (filename or "").strip()
         if not url:
             blank = np.zeros((1, 480, 832, 3), dtype=np.float32)
             return (torch.from_numpy(blank),)
@@ -1728,6 +1740,12 @@ class LoadAudioFromURLStereo:
             "required": {
                 "url": ("STRING", {"default": ""}),
                 "sample_rate": ("INT", {"default": 44100, "min": 8000, "max": 192000, "step": 1}),
+            },
+            "optional": {
+                # Graydient's init_<type>_* is a {bool, filename, url} triplet and
+                # it's unconfirmed which of filename/url gets populated for a given
+                # submission path -- accept both, first non-empty wins.
+                "filename": ("STRING", {"default": ""}),
             }
         }
 
@@ -1736,7 +1754,7 @@ class LoadAudioFromURLStereo:
     FUNCTION = "load"
     CATEGORY = "TripoSG"
 
-    def load(self, url, sample_rate):
+    def load(self, url, sample_rate, filename=""):
         import subprocess
         import tempfile
         import urllib.request
@@ -1744,10 +1762,25 @@ class LoadAudioFromURLStereo:
         import numpy as np
         import torch
 
-        with urllib.request.urlopen(url) as resp:
-            data = resp.read()
+        source = (url or "").strip() or (filename or "").strip()
+        if not source:
+            raise RuntimeError("LoadAudioFromURLStereo: no url or filename supplied")
 
-        with tempfile.NamedTemporaryFile(suffix=os.path.splitext(url.split("?")[0])[1] or ".bin") as tmp:
+        if source.startswith("http://") or source.startswith("https://"):
+            with urllib.request.urlopen(source) as resp:
+                data = resp.read()
+        else:
+            # Bare filename -- Graydient pre-staged this into ComfyUI's input/ dir.
+            # urllib.request.urlopen() would raise "unknown url type" on this, the
+            # exact anti-pattern documented elsewhere in this file for LoadImage/
+            # LoadVideoFromURL -- read it directly instead of fetching it.
+            local_path = folder_paths.get_annotated_filepath(source)
+            if not os.path.isfile(local_path):
+                raise FileNotFoundError(f"local audio upload not found: {source!r}")
+            with open(local_path, "rb") as fh:
+                data = fh.read()
+
+        with tempfile.NamedTemporaryFile(suffix=os.path.splitext(source.split("?")[0])[1] or ".bin") as tmp:
             tmp.write(data)
             tmp.flush()
             cmd = [
@@ -1757,7 +1790,7 @@ class LoadAudioFromURLStereo:
             ]
             proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             if proc.returncode != 0:
-                raise RuntimeError(f"ffmpeg failed to decode audio from {url}: {proc.stderr.decode(errors='replace')}")
+                raise RuntimeError(f"ffmpeg failed to decode audio from {source}: {proc.stderr.decode(errors='replace')}")
 
         arr = np.frombuffer(proc.stdout, dtype="<i2").astype("float32") / 32768.0
         arr = arr.reshape(-1, 2).T  # [channels=2, samples]
