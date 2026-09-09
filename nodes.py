@@ -84,14 +84,27 @@ class TripoSGModelLoader:
                     ["VAST-AI/TripoSG", "VAST-AI/TripoSG-scribble", "wgsxm/PartCrafter"],
                     {"default": "VAST-AI/TripoSG"},
                 )
-            }
+            },
+            "optional": {
+                "model_override": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "When non-empty, overrides the model dropdown above with this repo id. "
+                                   "Lets a Graydient slot (e.g. via PartCrafterModelSelect) drive the model "
+                                   "choice at runtime without rewiring the graph.",
+                    },
+                ),
+            },
         }
 
     RETURN_TYPES = ("TRIPOSG",)
     FUNCTION = "load_model"
     CATEGORY = "TripoSG"
 
-    def load_model(self, model):
+    def load_model(self, model, model_override=""):
+        if model_override and model_override.strip():
+            model = model_override.strip()
         model_name = model.split("/")[-1]
         model_dir = os.path.join(folder_paths.models_dir, "3D", model_name)
         os.makedirs(model_dir, exist_ok=True)
@@ -481,6 +494,58 @@ class PartCrafterConditioningNode:
         )
 
 
+class PartCrafterModelSelect:
+    """Turns a plain Graydient slot INT (0/1) into the TripoSG model repo id.
+
+    Wire its STRING output into TripoSGModelLoader's optional `model_override`
+    input. 0 -> VAST-AI/TripoSG (default), 1 -> wgsxm/PartCrafter. Mirrors
+    Meshsmuggler's MeshSmuggleGate: a plain-value toggle instead of a graph
+    rewire, since Graydient can only patch literal field values.
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "enable_partcrafter": ("INT", {"default": 0, "min": 0, "max": 1, "step": 1}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("model",)
+    FUNCTION = "select"
+    CATEGORY = "TripoSG"
+
+    def select(self, enable_partcrafter):
+        return ("wgsxm/PartCrafter" if int(enable_partcrafter) != 0 else "VAST-AI/TripoSG",)
+
+
+class SimplifyMeshFacesSelect:
+    """Turns a plain Graydient slot INT (0/1) into a target face count for SimplifyMesh.
+
+    0 -> 0 (SimplifyMesh no-ops, mesh passes through untouched).
+    1 -> target_faces (decimate to this count). Same slot-toggle pattern as
+    PartCrafterModelSelect / MeshSmuggleGate.
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "enable_simplify": ("INT", {"default": 0, "min": 0, "max": 1, "step": 1}),
+                "target_faces": ("INT", {"default": 50000, "min": 1, "max": 0xFFFFFFF, "step": 1}),
+            },
+        }
+
+    RETURN_TYPES = ("INT",)
+    RETURN_NAMES = ("faces",)
+    FUNCTION = "select"
+    CATEGORY = "TripoSG"
+
+    def select(self, enable_simplify, target_faces):
+        return (target_faces if int(enable_simplify) != 0 else 0,)
+
+
 class TrimeshToMESH:
     @classmethod
     def INPUT_TYPES(s):
@@ -673,6 +738,185 @@ class BakeVertexColorsFromViews:
             vertices=verts.copy(),
             faces=trimesh.faces.copy(),
             vertex_colors=vertex_colors,
+            process=False,
+        )
+        return (out,)
+
+
+class UVUnwrapAndBakeTexture:
+    """
+    xatlas UV-unwraps the mesh, then bakes a real basecolor texture into that
+    UV space from front/back view images (same perspective-projection sampling
+    as BakeVertexColorsFromViews, but rasterized per-pixel in UV space instead
+    of per-vertex). Attaches the result as a glTF PBR material (baseColorTexture
+    + constant roughness/metallic factors) instead of vertex colours — this is
+    a real textured UV mesh, not a learned PBR material estimate.
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "trimesh":     ("TRIMESH",),
+                "front_image": ("IMAGE",),
+                "cam_dist": ("FLOAT", {
+                    "default": 2.5, "min": 0.5, "max": 10.0, "step": 0.1,
+                    "tooltip": "Virtual camera distance along +Z, same convention as Bake Vertex Colors. "
+                               "Match to TripoSG training camera (~2.0-3.5)."
+                }),
+                "texture_size": ("INT", {"default": 1024, "min": 256, "max": 2048, "step": 256}),
+                "roughness": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "metallic":  ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "back_image_url": ("STRING", {
+                    "default": "",
+                    "tooltip": "Optional URL for a back-view image. Leave empty to mirror the front image."
+                }),
+            },
+            "optional": {
+                "back_image": ("IMAGE",),
+            },
+        }
+
+    RETURN_TYPES = ("TRIMESH",)
+    RETURN_NAMES = ("trimesh",)
+    FUNCTION = "bake"
+    CATEGORY = "TripoSG"
+    DESCRIPTION = ("xatlas UV-unwraps the mesh and bakes a real basecolor texture from "
+                   "front/back photos into a glTF PBR material.")
+
+    @staticmethod
+    def _project_to_image_uv(pos, normal, cam_dist):
+        # Same perspective-correct projection + 10% pad-square mapping used in
+        # BakeVertexColorsFromViews — kept in sync so bakes match vertex-colour
+        # results at the same cam_dist.
+        z     = pos[:, 2]
+        depth = np.maximum(cam_dist - z, 1e-3)
+        x_p   = pos[:, 0] / depth * cam_dist
+        y_p   = pos[:, 1] / depth * cam_dist
+
+        pad   = 0.1
+        inner = 1.0 - 2.0 * pad
+        xr = float(x_p.max() - x_p.min()) or 1.0
+        yr = float(y_p.max() - y_p.min()) or 1.0
+
+        if xr <= yr:
+            v      = pad + (1.0 - (y_p - y_p.min()) / yr) * inner
+            x_span = (xr / yr) * inner
+            u      = 0.5 - x_span * 0.5 + (x_p - x_p.min()) / xr * x_span
+        else:
+            u      = pad + (x_p - x_p.min()) / xr * inner
+            y_span = (yr / xr) * inner
+            v      = 0.5 - y_span * 0.5 + (1.0 - (y_p - y_p.min()) / yr) * y_span
+
+        w = np.clip((normal[:, 2] + 1.0) / 2.0, 0.0, 1.0)  # front/back blend weight
+        return u, v, w
+
+    def bake(self, trimesh, front_image, cam_dist=2.5, texture_size=1024,
+              roughness=0.6, metallic=0.0, back_image_url="", back_image=None):
+        import xatlas
+
+        def to_u8(t):
+            return (t[0].cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+
+        front_np = to_u8(front_image)
+        if back_image is not None:
+            back_np = to_u8(back_image)
+        elif back_image_url and back_image_url.strip():
+            import requests as _requests
+            resp = _requests.get(back_image_url.strip(), timeout=30)
+            resp.raise_for_status()
+            back_pil = Image.open(BytesIO(resp.content)).convert("RGB")
+            back_np = np.array(back_pil).astype(np.uint8)
+        else:
+            back_np = front_np[:, ::-1, :].copy()
+
+        verts = trimesh.vertices.astype(np.float32)
+        faces = trimesh.faces.astype(np.uint32)
+        src_normals = trimesh.vertex_normals.astype(np.float32)
+
+        vmapping, indices, uvs = xatlas.parametrize(verts, faces)
+        new_verts   = verts[vmapping]
+        new_normals = src_normals[vmapping]
+        new_faces   = indices.astype(np.int64).reshape(-1, 3)
+        uvs = uvs.astype(np.float32)  # (M, 2) in [0,1]
+
+        T = texture_size
+        tex   = np.zeros((T, T, 3), dtype=np.uint8)
+        filled = np.zeros((T, T), dtype=np.uint8)
+
+        # UV -> pixel space; V flipped so v=0 is bottom (image row 0 is top).
+        px = uvs[:, 0] * (T - 1)
+        py = (1.0 - uvs[:, 1]) * (T - 1)
+
+        def sample_img(img, uc, vc):
+            H, W = img.shape[:2]
+            ix = np.clip((uc * (W - 1)).astype(np.int32), 0, W - 1)
+            iy = np.clip((vc * (H - 1)).astype(np.int32), 0, H - 1)
+            return img[iy, ix].astype(np.float32)
+
+        for tri in new_faces:
+            tpx, tpy = px[tri], py[tri]
+            x0, x1 = int(np.floor(tpx.min())), int(np.ceil(tpx.max()))
+            y0, y1 = int(np.floor(tpy.min())), int(np.ceil(tpy.max()))
+            x0, y0 = max(x0, 0), max(y0, 0)
+            x1, y1 = min(x1, T - 1), min(y1, T - 1)
+            if x1 < x0 or y1 < y0:
+                continue
+
+            xs, ys = np.meshgrid(np.arange(x0, x1 + 1), np.arange(y0, y1 + 1))
+            xs = xs.astype(np.float32) + 0.5
+            ys = ys.astype(np.float32) + 0.5
+
+            x1v, y1v, x2v, y2v, x3v, y3v = tpx[0], tpy[0], tpx[1], tpy[1], tpx[2], tpy[2]
+            denom = (y2v - y3v) * (x1v - x3v) + (x3v - x2v) * (y1v - y3v)
+            if abs(denom) < 1e-8:
+                continue
+            w1 = ((y2v - y3v) * (xs - x3v) + (x3v - x2v) * (ys - y3v)) / denom
+            w2 = ((y3v - y1v) * (xs - x3v) + (x1v - x3v) * (ys - y3v)) / denom
+            w3 = 1.0 - w1 - w2
+
+            inside = (w1 >= -1e-4) & (w2 >= -1e-4) & (w3 >= -1e-4)
+            if not inside.any():
+                continue
+
+            v0, v1_, v2_ = new_verts[tri[0]], new_verts[tri[1]], new_verts[tri[2]]
+            n0, n1_, n2_ = new_normals[tri[0]], new_normals[tri[1]], new_normals[tri[2]]
+
+            pos_pix = (w1[..., None] * v0 + w2[..., None] * v1_ + w3[..., None] * v2_)
+            nrm_pix = (w1[..., None] * n0 + w2[..., None] * n1_ + w3[..., None] * n2_)
+
+            flat_pos = pos_pix[inside]
+            flat_nrm = nrm_pix[inside]
+            u_img, v_img, blend = self._project_to_image_uv(flat_pos, flat_nrm, cam_dist)
+
+            front_c = sample_img(front_np, u_img, v_img)
+            back_c  = sample_img(back_np, 1.0 - u_img, v_img)
+            rgb = front_c * blend[:, None] + back_c * (1.0 - blend[:, None])
+
+            py_idx = (ys[inside] - 0.5).astype(np.int32)
+            px_idx = (xs[inside] - 0.5).astype(np.int32)
+            tex[py_idx, px_idx] = rgb.clip(0, 255).astype(np.uint8)
+            filled[py_idx, px_idx] = 255
+
+        # Seam/gap padding — push filled colour into unbaked UV-chart borders
+        # so bilinear texture sampling doesn't pick up black at seams.
+        if (filled == 0).any() and (filled != 0).any():
+            mask = (filled == 0).astype(np.uint8) * 255
+            tex = cv2.inpaint(tex, mask, 3, cv2.INPAINT_TELEA)
+
+        tex_img = Image.fromarray(tex, mode="RGB")
+
+        material = Trimesh.visual.material.PBRMaterial(
+            baseColorTexture=tex_img,
+            roughnessFactor=float(roughness),
+            metallicFactor=float(metallic),
+        )
+        visual = Trimesh.visual.TextureVisuals(uv=uvs, material=material)
+
+        out = Trimesh.Trimesh(
+            vertices=new_verts,
+            faces=new_faces,
+            visual=visual,
             process=False,
         )
         return (out,)
@@ -1562,6 +1806,29 @@ class VLMInferFromURL:
         return (response, card, data)
 
 
+class ConcatStrings:
+    """Concatenate up to 8 STRING inputs in order. Empty parts are skipped.
+    Each part can be left as a literal widget value or overridden by a link, same as
+    any other plain STRING widget (see HFTextGenerate.user_prompt) -- no forceInput,
+    so this doubles as a way to splice a fixed literal template around dynamic
+    (LLM-generated or field-mapped) text without a separate templating node."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            f"part{i}": ("STRING", {"multiline": True, "default": ""})
+            for i in range(1, 9)
+        }}
+
+    RETURN_TYPES  = ("STRING",)
+    RETURN_NAMES  = ("text",)
+    FUNCTION      = "concat"
+    CATEGORY      = "TripoSG"
+
+    def concat(self, part1, part2, part3, part4, part5, part6, part7, part8):
+        return ("".join(p for p in (part1, part2, part3, part4, part5, part6, part7, part8) if p),)
+
+
 class EncodeStringAsImage:
     """Encode a STRING as a lossless RGB data IMAGE for Graydient output.
     ForgeExpress decodes it by reading pixel values back to UTF-8 bytes."""
@@ -1808,6 +2075,7 @@ NODE_CLASS_MAPPINGS = {
     "HFTextGenerate":         HFTextGenerate,
     "VLMInferFromURL":        VLMInferFromURL,
     "EncodeStringAsImage":    EncodeStringAsImage,
+    "ConcatStrings":          ConcatStrings,
     "AudioAnalyze":           AudioAnalyze,
     "LoadAudioFromURLStereo": LoadAudioFromURLStereo,
 }
@@ -1820,6 +2088,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "HFTextGenerate":         "HF Text Generate",
     "VLMInferFromURL":        "VLM Infer From URL",
     "EncodeStringAsImage":    "Encode String As Image",
+    "ConcatStrings":          "Concat Strings",
     "AudioAnalyze":           "Audio Analyze",
     "LoadAudioFromURLStereo": "Load Audio From URL (Stereo)",
 }
@@ -1831,21 +2100,27 @@ if _TRIPOSG_AVAILABLE:
         "TripoSGPrepareImage": TripoSGPrepareImage,
         "TripoSGConditioning": TripoSGScribbleConditioningNode,
         "PartCrafterConditioning": PartCrafterConditioningNode,
+        "PartCrafterModelSelect": PartCrafterModelSelect,
+        "SimplifyMeshFacesSelect": SimplifyMeshFacesSelect,
         "SimplifyMesh": SimplifyMesh,
         "MESHToTrimesh": MESHToTrimesh,
         "TrimeshToMESH": TrimeshToMESH,
         "SaveTrimesh": SaveTrimesh,
         "BakeVertexColorsFromViews": BakeVertexColorsFromViews,
+        "UVUnwrapAndBakeTexture": UVUnwrapAndBakeTexture,
     })
     NODE_DISPLAY_NAME_MAPPINGS.update({
         "TripoSGModelLoader": "TripoSG Model Loader",
         "TripoSGInference": "TripoSG Inference",
         "TripoSGConditioning": "TripoSG Scribble Conditioning",
         "PartCrafterConditioning": "PartCrafter Conditioning",
+        "PartCrafterModelSelect": "PartCrafter Model Select (slot toggle)",
+        "SimplifyMeshFacesSelect": "Simplify Mesh Faces Select (slot toggle)",
         "TripoSGPrepareImage": "TripoSG Prepare Image",
         "SimplifyMesh": "Simplify Mesh",
         "MESHToTrimesh": "Mesh to Trimesh",
         "TrimeshToMESH": "Trimesh to Mesh",
         "SaveTrimesh": "Save Trimesh",
         "BakeVertexColorsFromViews": "Bake Vertex Colors From Views",
+        "UVUnwrapAndBakeTexture": "UV Unwrap and Bake Texture (PBR)",
     })
