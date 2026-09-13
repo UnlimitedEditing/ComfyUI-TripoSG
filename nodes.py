@@ -2453,7 +2453,14 @@ class AudioAnalyze:
     FUNCTION      = "analyze"
     CATEGORY      = "TripoSG"
 
-    def analyze(self, url: str):
+    async def analyze(self, url: str):
+        # librosa beat/segment analysis takes tens of seconds on a full song; run
+        # it off the event loop (see BpyRenderTest._run_subprocess for why a
+        # blocked loop can make a finished job report timed_out).
+        import asyncio
+        return await asyncio.to_thread(self._analyze_sync, url)
+
+    def _analyze_sync(self, url: str):
         import json
         import os
         import shutil
@@ -2575,7 +2582,8 @@ class AudioAnalyze:
             plt.tight_layout(pad=0.4)
             fig.canvas.draw()
             w, h  = fig.canvas.get_width_height()
-            buf   = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(h, w, 3)
+            # tostring_rgb() was removed in matplotlib 3.10; pip installs latest.
+            buf   = np.asarray(fig.canvas.buffer_rgba())[..., :3].copy()
             plt.close(fig)
 
             spec_t   = torch.from_numpy(buf.astype(np.float32) / 255.0).unsqueeze(0)
