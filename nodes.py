@@ -1829,6 +1829,252 @@ class ConcatStrings:
         return ("".join(p for p in (part1, part2, part3, part4, part5, part6, part7, part8) if p),)
 
 
+class LoadVideoFromURLAsVideo:
+    """Download a video from a URL (or resolve a local Graydient upload filename)
+    and wrap it as ComfyUI's native VIDEO type -- unlike LoadVideoFromURL/
+    TripoSGLoadVideoFromURL, which only ever return a decoded IMAGE frame batch,
+    this preserves the container's real audio track and container-reported fps
+    so downstream GetVideoComponents (and any node expecting a real VIDEO
+    object) works exactly as it does with the core LoadVideo node."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"url": ("STRING", {"default": ""})}}
+
+    RETURN_TYPES = ("VIDEO",)
+    RETURN_NAMES = ("video",)
+    FUNCTION     = "load"
+    CATEGORY     = "TripoSG"
+
+    def load(self, url):
+        import requests
+        import tempfile
+        import shutil
+        from comfy_api.latest import InputImpl
+
+        url = url.strip()
+        is_remote = url.startswith("http://") or url.startswith("https://")
+
+        tmp_dir = tempfile.mkdtemp()
+        tmp_video = os.path.join(tmp_dir, "input.mp4")
+
+        if is_remote:
+            resp = requests.get(url, timeout=120, stream=True)
+            resp.raise_for_status()
+            with open(tmp_video, "wb") as fh:
+                for chunk in resp.iter_content(chunk_size=65536):
+                    fh.write(chunk)
+        else:
+            local_path = folder_paths.get_annotated_filepath(url)
+            if not os.path.isfile(local_path):
+                raise RuntimeError(f"local video upload not found: {url}")
+            shutil.copyfile(local_path, tmp_video)
+
+        # Deliberately not cleaned up here -- VideoFromFile streams from this
+        # path lazily as the graph executes; the OS temp dir is reclaimed on
+        # container restart, matching every other tmp_dir use in this file.
+        return (InputImpl.VideoFromFile(tmp_video),)
+
+
+_BPY_RENDER_SCRIPT = r'''
+import bpy, time, sys, os, math, subprocess, shutil
+import mathutils
+
+GLTF_PATH, OUT_PATH, WIDTH, HEIGHT, FRAME_COUNT, FPS, ENGINE, SAMPLES = sys.argv[1:9]
+WIDTH, HEIGHT, FRAME_COUNT, FPS, SAMPLES = int(WIDTH), int(HEIGHT), int(FRAME_COUNT), int(FPS), int(SAMPLES)
+
+t_start = time.time()
+bpy.ops.wm.read_factory_settings(use_empty=True)
+
+t0 = time.time()
+bpy.ops.import_scene.gltf(filepath=GLTF_PATH)
+t_import = time.time() - t0
+
+scene = bpy.context.scene
+min_co = mathutils.Vector((float("inf"),) * 3)
+max_co = mathutils.Vector((float("-inf"),) * 3)
+for obj in scene.objects:
+    if obj.type != "MESH":
+        continue
+    for corner in obj.bound_box:
+        w = obj.matrix_world @ mathutils.Vector(corner)
+        min_co.x, min_co.y, min_co.z = min(min_co.x, w.x), min(min_co.y, w.y), min(min_co.z, w.z)
+        max_co.x, max_co.y, max_co.z = max(max_co.x, w.x), max(max_co.y, w.y), max(max_co.z, w.z)
+
+center = (min_co + max_co) / 2
+size = max_co - min_co
+radius = max(size.x, size.y, size.z, 0.01)
+
+cam_data = bpy.data.cameras.new("Cam")
+cam_obj = bpy.data.objects.new("Cam", cam_data)
+scene.collection.objects.link(cam_obj)
+scene.camera = cam_obj
+cam_distance = radius * 2.2
+cam_obj.location = (center.x + cam_distance * 0.7, center.y - cam_distance * 0.9, center.z + cam_distance * 0.5)
+cam_obj.rotation_euler = (center - cam_obj.location).to_track_quat("-Z", "Y").to_euler()
+
+light_data = bpy.data.lights.new("Sun", type="SUN")
+light_data.energy = 3.0
+light_obj = bpy.data.objects.new("Sun", light_data)
+light_obj.rotation_euler = (math.radians(50), 0, math.radians(30))
+scene.collection.objects.link(light_obj)
+
+scene.render.engine = ENGINE
+gpu_found = False
+if ENGINE == "CYCLES":
+    scene.cycles.samples = SAMPLES
+    scene.cycles.device = "GPU"
+    prefs = bpy.context.preferences.addons["cycles"].preferences
+    prefs.compute_device_type = "CUDA"
+    prefs.get_devices()
+    for device in prefs.devices:
+        if device.type == "CUDA":
+            device.use = True
+            gpu_found = True
+        else:
+            device.use = False
+
+scene.render.resolution_x = WIDTH
+scene.render.resolution_y = HEIGHT
+scene.render.resolution_percentage = 100
+scene.render.fps = FPS
+scene.frame_start = 1
+scene.frame_end = FRAME_COUNT
+
+frames_dir = OUT_PATH + "_frames"
+if os.path.isdir(frames_dir):
+    shutil.rmtree(frames_dir)
+os.makedirs(frames_dir)
+scene.render.image_settings.file_format = "PNG"
+scene.render.filepath = frames_dir + "/frame_"
+
+t0 = time.time()
+bpy.ops.render.render(animation=True)
+t_render = time.time() - t0
+
+t0 = time.time()
+mux_ok = True
+try:
+    subprocess.check_call([
+        "ffmpeg", "-y", "-framerate", str(FPS),
+        "-i", frames_dir + "/frame_%04d.png",
+        "-pix_fmt", "yuv420p", "-c:v", "libx264",
+        OUT_PATH,
+    ], stderr=subprocess.DEVNULL)
+except Exception as e:
+    mux_ok = False
+t_mux = time.time() - t0
+
+t_total = time.time() - t_start
+print("===== BPY RENDER RESULTS =====")
+print(f"engine: {ENGINE}")
+print(f"gpu_device_found: {gpu_found}")
+print(f"resolution: {WIDTH}x{HEIGHT}")
+print(f"frames: {FRAME_COUNT} @ {FPS}fps")
+print(f"import_time_s: {t_import:.2f}")
+print(f"render_time_s: {t_render:.2f}")
+print(f"render_time_per_frame_s: {t_render/FRAME_COUNT:.3f}")
+print(f"mux_time_s: {t_mux:.2f}")
+print(f"mux_ok: {mux_ok}")
+print(f"total_time_s: {t_total:.2f}")
+print(f"output: {OUT_PATH}")
+'''
+
+
+class BpyRenderTest:
+    """Provisions an isolated Python 3.13 (bpy's pip wheels only exist for
+    cp311/cp313 -- Graydient's ComfyUI runs 3.12, so bpy cannot be imported
+    in-process) inside the ephemeral container, pip-installs bpy into it,
+    downloads a glTF test asset, and renders it headless via Blender's Python
+    API -- timing every phase separately (env provisioning, bpy import,
+    glTF import, render, ffmpeg mux) so the real per-job cost is measured,
+    not just render time. Tries EEVEE or CYCLES per the engine widget."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "gltf_url":    ("STRING", {"default": "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/Fox/glTF-Binary/Fox.glb"}),
+            "width":       ("INT", {"default": 1920, "min": 64, "max": 3840}),
+            "height":      ("INT", {"default": 1080, "min": 64, "max": 2160}),
+            "frame_count": ("INT", {"default": 48, "min": 1, "max": 4096}),
+            "fps":         ("INT", {"default": 24, "min": 1, "max": 60}),
+            "engine":      (["BLENDER_EEVEE", "CYCLES"], {"default": "BLENDER_EEVEE"}),
+            "samples":     ("INT", {"default": 32, "min": 1, "max": 4096}),
+        }}
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("report",)
+    FUNCTION     = "run"
+    CATEGORY     = "TripoSG"
+    OUTPUT_NODE  = True
+
+    PYTHON_URL = (
+        "https://github.com/astral-sh/python-build-standalone/releases/download/"
+        "20260901/cpython-3.13.15%2B20260901-x86_64-unknown-linux-gnu-install_only.tar.gz"
+    )
+
+    def run(self, gltf_url, width, height, frame_count, fps, engine, samples):
+        import subprocess, time, tempfile, tarfile, urllib.request
+
+        report_lines = []
+
+        def log(line):
+            print(line)
+            report_lines.append(line)
+
+        work_dir = os.path.join(tempfile.gettempdir(), "bpy_render_test")
+        os.makedirs(work_dir, exist_ok=True)
+        py_dir = os.path.join(work_dir, "python3.13")
+        py_bin = os.path.join(py_dir, "bin", "python3.13")
+
+        t0 = time.time()
+        if not os.path.isfile(py_bin):
+            tar_path = os.path.join(work_dir, "python.tar.gz")
+            urllib.request.urlretrieve(self.PYTHON_URL, tar_path)
+            with tarfile.open(tar_path) as tf:
+                tf.extractall(work_dir)
+            extracted = os.path.join(work_dir, "python")
+            if os.path.isdir(extracted) and not os.path.isdir(py_dir):
+                os.rename(extracted, py_dir)
+        t_python_provision = time.time() - t0
+
+        t0 = time.time()
+        bpy_already = subprocess.run(
+            [py_bin, "-c", "import bpy"], capture_output=True
+        ).returncode == 0
+        if not bpy_already:
+            subprocess.check_call([py_bin, "-m", "pip", "install", "--quiet", "bpy"])
+        t_bpy_install = time.time() - t0
+
+        gltf_path = os.path.join(work_dir, "asset.glb")
+        t0 = time.time()
+        urllib.request.urlretrieve(gltf_url, gltf_path)
+        t_gltf_download = time.time() - t0
+
+        script_path = os.path.join(work_dir, "render_test.py")
+        with open(script_path, "w") as f:
+            f.write(_BPY_RENDER_SCRIPT)
+
+        out_path = os.path.join(work_dir, "out.mp4")
+        proc = subprocess.run(
+            [py_bin, script_path, gltf_path, out_path,
+             str(width), str(height), str(frame_count), str(fps), engine, str(samples)],
+            capture_output=True, text=True,
+        )
+
+        log(f"python_provision_time_s: {t_python_provision:.2f} (cached: {os.path.isfile(py_bin) and t_python_provision < 1})")
+        log(f"bpy_install_time_s: {t_bpy_install:.2f} (already_installed: {bpy_already})")
+        log(f"gltf_download_time_s: {t_gltf_download:.2f}")
+        log("----- subprocess stdout -----")
+        log(proc.stdout)
+        if proc.returncode != 0:
+            log("----- subprocess stderr -----")
+            log(proc.stderr)
+
+        report = "\n".join(report_lines)
+        return {"ui": {"text": [report]}, "result": (report,)}
+
+
 class SystemDiagnostics:
     """Runs a battery of read-only shell/environment checks relevant to evaluating whether
     a Windows/D3D12-only tool (NVIDIA NGX, Wine/Proton, VKD3D-Proton, DXVK-NVAPI) could be
@@ -2132,6 +2378,8 @@ NODE_CLASS_MAPPINGS = {
     "AudioAnalyze":           AudioAnalyze,
     "LoadAudioFromURLStereo": LoadAudioFromURLStereo,
     "SystemDiagnostics":      SystemDiagnostics,
+    "LoadVideoFromURLAsVideo": LoadVideoFromURLAsVideo,
+    "BpyRenderTest":          BpyRenderTest,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LoadImageFromURL":       "Load Image From URL",
@@ -2146,6 +2394,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "AudioAnalyze":           "Audio Analyze",
     "LoadAudioFromURLStereo": "Load Audio From URL (Stereo)",
     "SystemDiagnostics":      "System Diagnostics (DLSS5 feasibility)",
+    "LoadVideoFromURLAsVideo": "Load Video From URL (as VIDEO)",
+    "BpyRenderTest":          "Bpy Render Test (Blender headless render-time budget)",
 }
 
 if _TRIPOSG_AVAILABLE:
