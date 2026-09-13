@@ -1829,6 +1829,59 @@ class ConcatStrings:
         return ("".join(p for p in (part1, part2, part3, part4, part5, part6, part7, part8) if p),)
 
 
+class SystemDiagnostics:
+    """Runs a battery of read-only shell/environment checks relevant to evaluating whether
+    a Windows/D3D12-only tool (NVIDIA NGX, Wine/Proton, VKD3D-Proton, DXVK-NVAPI) could be
+    made to run on this Graydient container. Everything here is print()'d during execution
+    so it lands in the job's stdout log even with no downstream node attached, and also
+    returned as one STRING for optional SaveText/output-node use."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {}}
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("report",)
+    FUNCTION     = "run"
+    CATEGORY     = "TripoSG"
+    OUTPUT_NODE  = True
+
+    def run(self):
+        import subprocess, os, shutil, glob
+
+        def sh(cmd):
+            try:
+                out = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=15)
+                return (out.stdout + out.stderr).strip() or "(empty)"
+            except Exception as e:
+                return f"(error: {e})"
+
+        sections = []
+
+        sections.append(("nvidia-smi", sh("nvidia-smi")))
+        sections.append(("nvidia driver version",
+                          sh("cat /proc/driver/nvidia/version 2>/dev/null || nvidia-smi --query-gpu=driver_version --format=csv,noheader")))
+        sections.append(("libnvidia-ngx.so present",
+                          sh("ldconfig -p | grep -i ngx || find / -iname 'libnvidia-ngx*' 2>/dev/null")))
+        sections.append(("vulkan support",
+                          sh("vulkaninfo --summary 2>&1 | head -40 || echo 'vulkaninfo not installed'")))
+        sections.append(("wine present", sh("which wine wine64 2>/dev/null || echo 'not found'")))
+        sections.append(("dxvk/vkd3d-proton on disk",
+                          sh("find / -iname '*vkd3d*' -o -iname '*dxvk*' 2>/dev/null | head -20")))
+        sections.append(("kernel / distro", sh("uname -a && cat /etc/os-release 2>/dev/null")))
+        sections.append(("gpu render nodes", sh("ls -la /dev/dri 2>/dev/null")))
+        sections.append(("free disk on /", sh("df -h / 2>/dev/null")))
+        sections.append(("apt/dpkg present", sh("which apt-get dpkg 2>/dev/null || echo 'none'")))
+
+        report_lines = []
+        for title, body in sections:
+            report_lines.append(f"===== {title} =====\n{body}\n")
+        report = "\n".join(report_lines)
+
+        print(report)
+        return {"ui": {"text": [report]}, "result": (report,)}
+
+
 class EncodeStringAsImage:
     """Encode a STRING as a lossless RGB data IMAGE for Graydient output.
     ForgeExpress decodes it by reading pixel values back to UTF-8 bytes."""
@@ -2078,6 +2131,7 @@ NODE_CLASS_MAPPINGS = {
     "ConcatStrings":          ConcatStrings,
     "AudioAnalyze":           AudioAnalyze,
     "LoadAudioFromURLStereo": LoadAudioFromURLStereo,
+    "SystemDiagnostics":      SystemDiagnostics,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LoadImageFromURL":       "Load Image From URL",
@@ -2091,6 +2145,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ConcatStrings":          "Concat Strings",
     "AudioAnalyze":           "Audio Analyze",
     "LoadAudioFromURLStereo": "Load Audio From URL (Stereo)",
+    "SystemDiagnostics":      "System Diagnostics (DLSS5 feasibility)",
 }
 
 if _TRIPOSG_AVAILABLE:
