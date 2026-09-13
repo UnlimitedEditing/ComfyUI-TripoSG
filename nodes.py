@@ -2013,8 +2013,44 @@ class BpyRenderTest:
         "20260901/cpython-3.13.15%2B20260901-x86_64-unknown-linux-gnu-install_only.tar.gz"
     )
 
-    def run(self, gltf_url, width, height, frame_count, fps, engine, samples):
-        import subprocess, time, tempfile, tarfile, urllib.request
+    @staticmethod
+    async def _run_subprocess(args):
+        """Runs a subprocess without blocking the asyncio event loop (unlike
+        subprocess.run, which stalls ComfyUI's entire async executor for the
+        whole child lifetime -- suspected cause of jobs reporting timed_out
+        with no error even though the work itself finished per the logs).
+        Launches in its own process group and explicitly kills that group
+        afterward so no orphaned Blender/ffmpeg children are left holding
+        GPU/file-descriptor resources that could make the container look
+        "still busy" to Graydient's own health check after we've returned."""
+        import asyncio, os as _os, signal
+
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = await proc.communicate()
+        finally:
+            if proc.returncode is None:
+                try:
+                    _os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            else:
+                # Reap any stray children left in this process group (e.g.
+                # ffmpeg spawned by bpy's own subprocess call) even though
+                # the direct child already exited cleanly.
+                try:
+                    _os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+        return proc.returncode, stdout.decode(errors="replace"), stderr.decode(errors="replace")
+
+    async def run(self, gltf_url, width, height, frame_count, fps, engine, samples):
+        import asyncio, time, tempfile, tarfile, urllib.request
 
         report_lines = []
 
@@ -2030,7 +2066,7 @@ class BpyRenderTest:
         t0 = time.time()
         if not os.path.isfile(py_bin):
             tar_path = os.path.join(work_dir, "python.tar.gz")
-            urllib.request.urlretrieve(self.PYTHON_URL, tar_path)
+            await asyncio.to_thread(urllib.request.urlretrieve, self.PYTHON_URL, tar_path)
             with tarfile.open(tar_path) as tf:
                 tf.extractall(work_dir)
             extracted = os.path.join(work_dir, "python")
@@ -2039,16 +2075,19 @@ class BpyRenderTest:
         t_python_provision = time.time() - t0
 
         t0 = time.time()
-        bpy_already = subprocess.run(
-            [py_bin, "-c", "import bpy"], capture_output=True
-        ).returncode == 0
+        bpy_check_rc, _, _ = await self._run_subprocess([py_bin, "-c", "import bpy"])
+        bpy_already = bpy_check_rc == 0
         if not bpy_already:
-            subprocess.check_call([py_bin, "-m", "pip", "install", "--quiet", "bpy"])
+            install_rc, install_out, install_err = await self._run_subprocess(
+                [py_bin, "-m", "pip", "install", "--quiet", "bpy"]
+            )
+            if install_rc != 0:
+                log(f"bpy_install_FAILED: rc={install_rc}\n{install_err}")
         t_bpy_install = time.time() - t0
 
         gltf_path = os.path.join(work_dir, "asset.glb")
         t0 = time.time()
-        urllib.request.urlretrieve(gltf_url, gltf_path)
+        await asyncio.to_thread(urllib.request.urlretrieve, gltf_url, gltf_path)
         t_gltf_download = time.time() - t0
 
         script_path = os.path.join(work_dir, "render_test.py")
@@ -2056,20 +2095,19 @@ class BpyRenderTest:
             f.write(_BPY_RENDER_SCRIPT)
 
         out_path = os.path.join(work_dir, "out.mp4")
-        proc = subprocess.run(
-            [py_bin, script_path, gltf_path, out_path,
-             str(width), str(height), str(frame_count), str(fps), engine, str(samples)],
-            capture_output=True, text=True,
-        )
+        returncode, stdout, stderr = await self._run_subprocess([
+            py_bin, script_path, gltf_path, out_path,
+            str(width), str(height), str(frame_count), str(fps), engine, str(samples),
+        ])
 
         log(f"python_provision_time_s: {t_python_provision:.2f} (cached: {os.path.isfile(py_bin) and t_python_provision < 1})")
         log(f"bpy_install_time_s: {t_bpy_install:.2f} (already_installed: {bpy_already})")
         log(f"gltf_download_time_s: {t_gltf_download:.2f}")
         log("----- subprocess stdout -----")
-        log(proc.stdout)
-        if proc.returncode != 0:
+        log(stdout)
+        if returncode != 0:
             log("----- subprocess stderr -----")
-            log(proc.stderr)
+            log(stderr)
 
         report = "\n".join(report_lines)
         return {"ui": {"text": [report]}, "result": (report,)}
