@@ -2118,6 +2118,9 @@ import bpy, math, sys, time, os, shutil, subprocess
 
 OUT_PATH, WIDTH, HEIGHT, FRAME_COUNT, FPS, GRID_N = sys.argv[1:7]
 WIDTH, HEIGHT, FRAME_COUNT, FPS, GRID_N = int(WIDTH), int(HEIGHT), int(FRAME_COUNT), int(FPS), int(GRID_N)
+# FRAME_STEP=2 renders "on twos": every other frame is rendered and each is held
+# twice at mux time, so the deliverable keeps FRAME_COUNT frames @ FPS.
+FRAME_STEP = max(1, int(sys.argv[7])) if len(sys.argv) > 7 else 1
 
 t_start = time.time()
 bpy.ops.wm.read_factory_settings(use_empty=True)
@@ -2222,6 +2225,8 @@ scene.render.resolution_percentage = 100
 scene.render.fps = FPS
 scene.frame_start = 1
 scene.frame_end = FRAME_COUNT
+scene.frame_step = FRAME_STEP
+RENDERED_FRAMES = len(range(1, FRAME_COUNT + 1, FRAME_STEP))
 
 frames_dir = OUT_PATH + "_frames"
 if os.path.isdir(frames_dir):
@@ -2235,11 +2240,20 @@ bpy.ops.render.render(animation=True)
 t_render = time.time() - t0
 
 t0 = time.time()
+# frame_step leaves gaps in the numbering (0001, 0003, ...) -- renumber
+# contiguously so ffmpeg's image2 sequence reader doesn't stop at the first gap.
+if FRAME_STEP > 1:
+    for i, f in enumerate(range(1, FRAME_COUNT + 1, FRAME_STEP)):
+        os.rename(f"{frames_dir}/frame_{f:04d}.png", f"{frames_dir}/seq_{i + 1:04d}.png")
+    seq_pattern = frames_dir + "/seq_%04d.png"
+else:
+    seq_pattern = frames_dir + "/frame_%04d.png"
 mux_ok = True
 try:
     subprocess.check_call([
-        "ffmpeg", "-y", "-framerate", str(FPS),
-        "-i", frames_dir + "/frame_%04d.png",
+        "ffmpeg", "-y", "-framerate", f"{FPS}/{FRAME_STEP}",
+        "-i", seq_pattern,
+        "-r", str(FPS),
         "-pix_fmt", "yuv420p", "-c:v", "libx264",
         OUT_PATH,
     ], stderr=subprocess.DEVNULL)
@@ -2252,8 +2266,11 @@ print("===== BPY PROCEDURAL FIELD RESULTS =====")
 print(f"instances: {GRID_N * GRID_N}")
 print(f"resolution: {WIDTH}x{HEIGHT}")
 print(f"frames: {FRAME_COUNT} @ {FPS}fps")
+print(f"frame_step: {FRAME_STEP}")
+print(f"rendered_frames: {RENDERED_FRAMES}")
 print(f"render_time_s: {t_render:.2f}")
-print(f"render_time_per_frame_s: {t_render/FRAME_COUNT:.3f}")
+print(f"render_time_per_rendered_frame_s: {t_render/RENDERED_FRAMES:.3f}")
+print(f"render_time_per_output_frame_s: {t_render/FRAME_COUNT:.3f}")
 print(f"mux_time_s: {t_mux:.2f}")
 print(f"mux_ok: {mux_ok}")
 print(f"total_time_s: {t_total:.2f}")
@@ -2279,6 +2296,8 @@ class BpyProceduralField:
             "frame_count": ("INT", {"default": 240, "min": 1, "max": 4096}),
             "fps":         ("INT", {"default": 24, "min": 1, "max": 60}),
             "grid_n":      ("INT", {"default": 16, "min": 2, "max": 64}),
+        }, "optional": {
+            "frame_step":  ("INT", {"default": 1, "min": 1, "max": 4}),
         }}
 
     RETURN_TYPES = ("VIDEO", "STRING")
@@ -2290,7 +2309,7 @@ class BpyProceduralField:
     PYTHON_URL = BpyRenderTest.PYTHON_URL
     _run_subprocess = staticmethod(BpyRenderTest._run_subprocess)
 
-    async def run(self, width, height, frame_count, fps, grid_n):
+    async def run(self, width, height, frame_count, fps, grid_n, frame_step=1):
         import asyncio, time, tempfile, tarfile, urllib.request
         from comfy_api.latest import InputImpl
 
@@ -2334,7 +2353,7 @@ class BpyProceduralField:
         out_path = os.path.join(work_dir, "procedural_field.mp4")
         returncode, stdout, stderr = await self._run_subprocess([
             py_bin, script_path, out_path,
-            str(width), str(height), str(frame_count), str(fps), str(grid_n),
+            str(width), str(height), str(frame_count), str(fps), str(grid_n), str(frame_step),
         ])
 
         log(f"python_provision_time_s: {t_python_provision:.2f}")
