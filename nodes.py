@@ -1518,26 +1518,25 @@ class LoadVideoFromURLMatched:
                     shutil.copyfile(local_path, tmp_video)
                 probe = subprocess.run(
                     ["ffprobe", "-v", "error", "-select_streams", "v:0",
-                     "-show_entries",
-                     "stream=width,height,avg_frame_rate,r_frame_rate,nb_frames,duration:"
-                     "stream_tags=rotate:stream_side_data=rotation:format=duration",
-                     "-of", "json", tmp_video],
-                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                     "-show_streams", "-show_format", "-of", "json", tmp_video],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 try:
                     info = _json.loads(probe.stdout or b"{}")
                     st = (info.get("streams") or [{}])[0]
                     src_w, src_h = int(st.get("width", 0)), int(st.get("height", 0))
-                    rot = st.get("tags", {}).get("rotate")
+                    rot = (st.get("tags") or {}).get("rotate")
                     for sd in st.get("side_data_list", []) or []:
-                        rot = sd.get("rotation", rot)
+                        if "rotation" in sd:
+                            rot = sd["rotation"]
                     if rot is not None and abs(int(float(rot))) % 180 == 90:
                         src_w, src_h = src_h, src_w
                     src_fps = self._rate(st.get("avg_frame_rate")) or self._rate(st.get("r_frame_rate"))
-                    src_dur = float(st.get("duration") or info.get("format", {}).get("duration") or 0)
+                    src_dur = float(st.get("duration") or (info.get("format") or {}).get("duration") or 0)
                     if not src_dur and st.get("nb_frames") and src_fps:
                         src_dur = float(st["nb_frames"]) / src_fps
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[LoadVideoFromURLMatched] ffprobe parse failed: {e!r} "
+                          f"rc={probe.returncode} stderr={probe.stderr[-300:]!r}")
             if src_w <= 0 or src_h <= 0:
                 src_w, src_h = 768, 512            # unreadable/blank: fall back to the old default
 
@@ -1566,6 +1565,8 @@ class LoadVideoFromURLMatched:
             else:
                 n = 97
             need = n - 1
+            print(f"[LoadVideoFromURLMatched] source {src_w}x{src_h} {src_fps:.2f}fps {src_dur:.2f}s -> "
+                  f"{out_w}x{out_h} {out_fps}fps N={n}")
 
             if not url:
                 blank = np.zeros((need, out_h, out_w, 3), dtype=np.float32)
