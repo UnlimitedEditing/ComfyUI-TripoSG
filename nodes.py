@@ -1432,6 +1432,164 @@ class LoadVideoFromURLAuto:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+class LoadVideoFromURLMatched:
+    """Load a source video for the Ripple edit workflow, MEASURING it for any of
+    width/height/length/fps the user left at 0 (the "not provided" sentinel).
+
+    Returns (N-1) frames resized (cover + centre-crop) to the resolved size, plus the
+    resolved width, height, length (N, snapped 8k+1) and fps so the rest of the graph
+    can be driven from them. N-1 because the Ripple graph prepends the edited first
+    frame to the source frames to make N. If the clip is shorter than requested the last
+    frame is repeated so the batch always has exactly N-1 frames."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "url":    ("STRING", {"default": ""}),
+                "width":  ("INT",   {"default": 0, "min": 0, "max": 4096}),
+                "height": ("INT",   {"default": 0, "min": 0, "max": 4096}),
+                "length": ("INT",   {"default": 0, "min": 0, "max": 4096}),
+                "fps":    ("FLOAT", {"default": 0.0, "min": 0.0, "max": 120.0}),
+            },
+            "optional": {
+                "filename":      ("STRING", {"default": ""}),
+                "target_pixels": ("INT", {"default": 393216, "min": 65536, "max": 4194304}),
+                "max_length":    ("INT", {"default": 161, "min": 9, "max": 4096}),
+                "min_side":      ("INT", {"default": 256, "min": 32, "max": 2048}),
+                "max_side":      ("INT", {"default": 1280, "min": 64, "max": 4096}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "INT", "INT", "INT", "FLOAT")
+    RETURN_NAMES = ("frames", "width", "height", "length", "fps")
+    FUNCTION = "load"
+    CATEGORY = "TripoSG"
+
+    @staticmethod
+    def _snap32(v, lo, hi):
+        return int(min(hi, max(lo, round(v / 32.0) * 32)))
+
+    @staticmethod
+    def _snap_len(v, lo, hi):
+        n = int(round((v - 1) / 8.0)) * 8 + 1
+        return int(min(hi, max(lo, n)))
+
+    @staticmethod
+    def _rate(s):
+        try:
+            a, b = str(s).split("/")
+            return float(a) / float(b) if float(b) else 0.0
+        except Exception:
+            try:
+                return float(s)
+            except Exception:
+                return 0.0
+
+    def load(self, url, width=0, height=0, length=0, fps=0.0, filename="",
+             target_pixels=393216, max_length=161, min_side=256, max_side=1280):
+        import json as _json
+        import math
+        import shutil
+        import subprocess
+        import tempfile
+
+        import requests
+
+        max_length = (max_length - 1) // 8 * 8 + 1
+        url = (url or "").strip() or (filename or "").strip()
+        tmp_dir = tempfile.mkdtemp()
+        tmp_video = os.path.join(tmp_dir, "input.mp4")
+        frames_dir = os.path.join(tmp_dir, "frames")
+        os.makedirs(frames_dir)
+        try:
+            src_w, src_h, src_fps, src_dur = 0, 0, 0.0, 0.0
+            if url:
+                if url.startswith("http://") or url.startswith("https://"):
+                    resp = requests.get(url, timeout=120, stream=True)
+                    resp.raise_for_status()
+                    with open(tmp_video, "wb") as fh:
+                        for chunk in resp.iter_content(chunk_size=65536):
+                            fh.write(chunk)
+                else:
+                    local_path = folder_paths.get_annotated_filepath(url)
+                    if not os.path.isfile(local_path):
+                        raise RuntimeError(f"local video upload not found: {url}")
+                    shutil.copyfile(local_path, tmp_video)
+                probe = subprocess.run(
+                    ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                     "-show_entries",
+                     "stream=width,height,avg_frame_rate,r_frame_rate,nb_frames,duration:"
+                     "stream_tags=rotate:stream_side_data=rotation:format=duration",
+                     "-of", "json", tmp_video],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                try:
+                    info = _json.loads(probe.stdout or b"{}")
+                    st = (info.get("streams") or [{}])[0]
+                    src_w, src_h = int(st.get("width", 0)), int(st.get("height", 0))
+                    rot = st.get("tags", {}).get("rotate")
+                    for sd in st.get("side_data_list", []) or []:
+                        rot = sd.get("rotation", rot)
+                    if rot is not None and abs(int(float(rot))) % 180 == 90:
+                        src_w, src_h = src_h, src_w
+                    src_fps = self._rate(st.get("avg_frame_rate")) or self._rate(st.get("r_frame_rate"))
+                    src_dur = float(st.get("duration") or info.get("format", {}).get("duration") or 0)
+                    if not src_dur and st.get("nb_frames") and src_fps:
+                        src_dur = float(st["nb_frames"]) / src_fps
+                except Exception:
+                    pass
+            if src_w <= 0 or src_h <= 0:
+                src_w, src_h = 768, 512            # unreadable/blank: fall back to the old default
+
+            # ---- size ----
+            width, height = int(width), int(height)
+            if width <= 0 and height <= 0:
+                s = math.sqrt(target_pixels / float(src_w * src_h))
+                width, height = src_w * s, src_h * s
+            elif width <= 0:
+                width = height * src_w / float(src_h)
+            elif height <= 0:
+                height = width * src_h / float(src_w)
+            out_w = self._snap32(width, min_side, max_side)
+            out_h = self._snap32(height, min_side, max_side)
+
+            # ---- fps ----
+            out_fps = float(fps) if fps and fps > 0 else (round(src_fps, 2) if src_fps > 0 else 24.0)
+            out_fps = min(30.0, max(8.0, out_fps))
+
+            # ---- length (N, 8k+1) ----
+            if length and length > 0:
+                n = self._snap_len(length, 25, max_length)
+            elif src_dur > 0:
+                avail = int(src_dur * out_fps)
+                n = max(9, (min(avail, max_length) - 1) // 8 * 8 + 1)
+            else:
+                n = 97
+            need = n - 1
+
+            if not url:
+                blank = np.zeros((need, out_h, out_w, 3), dtype=np.float32)
+                return (torch.from_numpy(blank), out_w, out_h, n, out_fps)
+
+            subprocess.check_call([
+                "ffmpeg", "-y", "-i", tmp_video,
+                "-vf", (f"fps={out_fps},scale={out_w}:{out_h}:force_original_aspect_ratio=increase:flags=lanczos,"
+                        f"crop={out_w}:{out_h}"),
+                "-frames:v", str(need), "-pix_fmt", "rgb24", "-f", "image2",
+                os.path.join(frames_dir, "frame_%05d.png"),
+            ], stderr=subprocess.DEVNULL)
+            frame_paths = sorted(Path(frames_dir).glob("frame_*.png"))
+            if not frame_paths:
+                raise RuntimeError("ffmpeg produced no frames from the video")
+            frames = [np.array(Image.open(p).convert("RGB")) for p in frame_paths[:need]]
+            while len(frames) < need:                # clip shorter than requested: hold last frame
+                frames.append(frames[-1])
+            return (torch.from_numpy(np.stack(frames).astype(np.float32) / 255.0),
+                    out_w, out_h, n, out_fps)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 _FONT_CACHE = {}
 
 
@@ -2671,6 +2829,7 @@ NODE_CLASS_MAPPINGS = {
     "LoadImageFromURL":       LoadImageFromURL,
     "TripoSGLoadVideoFromURL": TripoSGLoadVideoFromURL,
     "LoadVideoFromURLAuto":   LoadVideoFromURLAuto,
+    "LoadVideoFromURLMatched": LoadVideoFromURLMatched,
     "TranscribeAudioFromURL": TranscribeAudioFromURL,
     "BurnSubtitlesFromTimeline": BurnSubtitlesFromTimeline,
     "HFTextGenerate":         HFTextGenerate,
@@ -2688,6 +2847,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LoadImageFromURL":       "Load Image From URL",
     "TripoSGLoadVideoFromURL": "TripoSG Load Video From URL",
     "LoadVideoFromURLAuto":   "Load Video From URL (Auto Res)",
+    "LoadVideoFromURLMatched": "Load Video From URL (Measure Size/Length/FPS)",
     "TranscribeAudioFromURL": "Transcribe Audio From URL",
     "BurnSubtitlesFromTimeline": "Burn Subtitles From Timeline",
     "HFTextGenerate":         "HF Text Generate",
