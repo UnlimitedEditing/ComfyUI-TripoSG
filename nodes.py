@@ -1447,10 +1447,10 @@ class LoadVideoFromURLMatched:
         return {
             "required": {
                 "url":    ("STRING", {"default": ""}),
-                "width":  ("INT",   {"default": 0, "min": 0, "max": 4096}),
-                "height": ("INT",   {"default": 0, "min": 0, "max": 4096}),
-                "length": ("INT",   {"default": 0, "min": 0, "max": 4096}),
-                "fps":    ("FLOAT", {"default": 0.0, "min": 0.0, "max": 120.0}),
+                "width":  ("INT",   {"default": 0, "min": 0, "max": 16384}),
+                "height": ("INT",   {"default": 0, "min": 0, "max": 16384}),
+                "length": ("INT",   {"default": 0, "min": 0, "max": 100000}),
+                "fps":    ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1000.0}),
             },
             "optional": {
                 "filename":      ("STRING", {"default": ""}),
@@ -1541,6 +1541,7 @@ class LoadVideoFromURLMatched:
                 src_w, src_h = 768, 512            # unreadable/blank: fall back to the old default
 
             # ---- size ----
+            width_in, height_in = width, height
             width, height = int(width), int(height)
             if width <= 0 and height <= 0:
                 s = math.sqrt(target_pixels / float(src_w * src_h))
@@ -1549,16 +1550,21 @@ class LoadVideoFromURLMatched:
                 width = height * src_w / float(src_h)
             elif height <= 0:
                 height = width * src_h / float(src_w)
-            out_w = self._snap32(width, min_side, max_side)
-            out_h = self._snap32(height, min_side, max_side)
+            # explicit sizes are not capped (MAX accounts have longer render windows); the
+            # min/max clamp only shapes the auto-measured size
+            explicit = int(width_in) > 0 or int(height_in) > 0
+            lo, hi = (64, 16384) if explicit else (min_side, max_side)
+            out_w = self._snap32(width, lo, hi)
+            out_h = self._snap32(height, lo, hi)
 
             # ---- fps ----
             out_fps = float(fps) if fps and fps > 0 else (round(src_fps, 2) if src_fps > 0 else 24.0)
-            out_fps = min(30.0, max(8.0, out_fps))
+            if not (fps and fps > 0):
+                out_fps = min(30.0, max(8.0, out_fps))     # explicit fps is not clamped
 
             # ---- length (N, 8k+1) ----
             if length and length > 0:
-                n = self._snap_len(length, 25, max_length)
+                n = self._snap_len(length, 9, 100000)      # explicit length is not capped
             elif src_dur > 0:
                 avail = int(src_dur * out_fps)
                 n = max(9, (min(avail, max_length) - 1) // 8 * 8 + 1)
