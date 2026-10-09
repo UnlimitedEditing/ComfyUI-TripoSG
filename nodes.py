@@ -1558,9 +1558,10 @@ class LoadVideoFromURLMatched:
             out_h = self._snap32(height, lo, hi)
 
             # ---- fps ----
-            out_fps = float(fps) if fps and fps > 0 else (round(src_fps, 2) if src_fps > 0 else 24.0)
-            if not (fps and fps > 0):
-                out_fps = min(30.0, max(8.0, out_fps))     # explicit fps is not clamped
+            # auto = 30 regardless of the source rate: LTX handles surplus frames fine (it skips the extras)
+            # but "deep fries" the clip when asked to match a low source rate. Explicit fps (e.g. 60 for
+            # dramatic motion) is used as given, uncapped.
+            out_fps = float(fps) if fps and fps > 0 else 30.0
 
             # ---- length (N, 8k+1) ----
             if length and length > 0:
